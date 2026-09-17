@@ -1,0 +1,7 @@
+error_id,file,reference,description
+E1,invoices.csv,INV5001,invoice net 780.00 vs PO 800.00
+E2,invoices.csv,INV5002,duplicate invoice_id row added
+E3,payments.csv,INV99999,payment points to non-existent invoice
+E4,fx_rates.csv,2026-02-28,EUR/USD rate deliberately changed from 1.09 to 1.19
+E5,DOWNSTREAM,intercompany_entries,delete one side of a generated intercompany pair
+E6,DOWNSTREAM,intercompany_entries,blank one generated intercompany amount
