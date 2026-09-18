@@ -8,6 +8,7 @@ produced by the pipeline. Everything else is exit codes, safety and determinism.
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import sys
 from dataclasses import replace
@@ -21,6 +22,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import pipeline  # noqa: E402
 from audit import build_audit_trail, build_exception_records  # noqa: E402
+from exception_workflow import (  # noqa: E402
+    INVESTIGATING,
+    RESOLVED,
+    assign_owner,
+    build_exception_register,
+    transition_exception,
+)
 from controls import decide_close, run_controls  # noqa: E402
 from intercompany import check_elimination, generate_intercompany_entries  # noqa: E402
 from match import three_way_match  # noqa: E402
@@ -46,11 +54,12 @@ PACKAGE_FILES = [
     "close_decision.json",
     "audit_trail.json",
     "exceptions.json",
+    "exception_register.json",
     "package_manifest.json",
 ]
 PACKAGE_ROLES = (
     "report_pdf", "control_results", "close_decision",
-    "audit_trail", "exceptions", "package_manifest",
+    "audit_trail", "exceptions", "exception_register", "package_manifest",
 )
 
 
@@ -191,12 +200,14 @@ def test_pipeline_package_is_identical_to_running_the_modules_directly(tmp_path:
     decision = decide_close(results, dataset_label="clean", run_timestamp=FIXED_TIMESTAMP)
     exception_records = build_exception_records(results)
     audit_trail = build_audit_trail(results, decision, exception_records=exception_records)
+    exception_register = build_exception_register(exception_records, "clean")
     model = build_report_model(
         match_results=match_results, invoices=invoices, payments=payments,
         ic_entries=entries, ic_elimination=elimination, shared_costs=shared_costs,
         fx_actual=fx_actual, fx_reference=fx_reference, control_results=results,
         decision=decision, inputs=describe_inputs(paths), max_exception_rows=25,
         audit_trail=audit_trail, exception_records=exception_records,
+        exception_register=exception_register,
     )
     manual = write_decision_package(model, tmp_path / "manual")
     piped = run_close(config_for(tmp_path, out_dir=tmp_path / "piped")).written
@@ -315,7 +326,8 @@ def test_dry_run_still_returns_a_full_result(tmp_path: Path):
 # 13. structure guard: the orchestration layer stays an orchestration layer
 # ---------------------------------------------------------------------------
 ALLOWED_PROJECT_IMPORTS = {
-    "match", "intercompany", "controls", "report", "audit", "plant_downstream_errors",
+    "match", "intercompany", "controls", "report", "audit", "exception_workflow",
+    "plant_downstream_errors",
 }
 ALLOWED_THIRD_PARTY = {"pandas"}
 
@@ -351,7 +363,8 @@ def test_pipeline_delegates_every_accounting_step():
     """Each step of the close must be a call into an existing module."""
     for name in ("three_way_match", "generate_intercompany_entries", "check_elimination",
                  "run_controls", "decide_close", "build_exception_records",
-                 "build_audit_trail", "build_report_model", "write_decision_package"):
+                 "build_audit_trail", "build_exception_register",
+                 "build_report_model", "write_decision_package"):
         attribute = getattr(pipeline, name, None)
         assert attribute is not None, f"pipeline does not use {name}"
         assert attribute.__module__ != "pipeline", (
@@ -581,3 +594,243 @@ def test_audit_construction_happens_in_the_pipeline_not_the_writer(tmp_path: Pat
 
     assert json.loads(written["audit_trail"].read_text(encoding="utf-8")) == {}
     assert json.loads(written["exceptions"].read_text(encoding="utf-8")) == []
+
+
+# ---------------------------------------------------------------------------
+# 18. the exception register in the decision package (Step 12B)
+# ---------------------------------------------------------------------------
+def _register_of(written: dict) -> dict:
+    return json.loads(written["exception_register"].read_text(encoding="utf-8"))
+
+
+def test_clean_register_exists_and_is_empty_without_changing_the_close(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    result = run_close(config_for(tmp_path))
+    register = _register_of(result.written)
+
+    assert result.written["exception_register"].name == "exception_register.json"
+    assert register["exception_count"] == 0
+    assert register["exceptions"] == []
+    assert register["dataset_label"] == "clean"
+    assert result.close_status == "PASS"
+    assert result.report_allowed is True
+
+
+def test_e4_register_holds_exactly_the_two_fx_exceptions(tmp_path: Path):
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4")
+    )
+    register = _register_of(result.written)
+
+    assert register["exception_count"] == 2
+    assert [item["exception_id"] for item in register["exceptions"]] == [
+        "EXC-FXC-03-E4",
+        "EXC-FXC-05-E4",
+    ]
+    # opening an investigation record does not soften the verdict
+    assert result.close_status == "FAIL"
+    assert result.report_allowed is False
+    assert result.exit_code == EXIT_BLOCKED
+
+
+def test_e1_to_e3_register_holds_the_three_matching_exceptions(tmp_path: Path):
+    _require(ERR / "invoices.csv")
+    result = run_close(
+        config_for(tmp_path, data_dir=ERR, fx_rates=RAW / "fx_rates.csv",
+                   dataset_label="E1-E3")
+    )
+    register = _register_of(result.written)
+
+    assert [item["exception_id"] for item in register["exceptions"]] == [
+        "EXC-MAT-03-E2",
+        "EXC-MAT-04-E1",
+        "EXC-MAT-06-E3",
+    ]
+    assert result.close_status == "FAIL"
+    assert result.report_allowed is False
+
+
+def test_every_register_entry_opens_as_open_and_unowned(tmp_path: Path):
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4")
+    )
+    for entry in _register_of(result.written)["exceptions"]:
+        assert entry["status"] == "OPEN"
+        assert entry["owner"] is None
+        assert entry["resolution"] is None
+
+
+def test_the_register_is_built_from_the_same_records_audit_produced(tmp_path: Path):
+    """One source of truth: the register opens records, it does not find them."""
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"),
+                   dataset_label="E4", write_package=False)
+    )
+    registered = [entry["source_exception"] for entry in result.exception_register["exceptions"]]
+    for source in registered:
+        assert source in result.exception_records
+    assert len(registered) == len(result.exception_records)
+
+
+def test_the_result_object_exposes_the_register_that_was_written(tmp_path: Path):
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4")
+    )
+    assert result.exception_register == _register_of(result.written)
+    assert result.model.exception_register == result.exception_register
+
+
+# ---------------------------------------------------------------------------
+# 19. resolution isolation: the close decision stays authoritative
+# ---------------------------------------------------------------------------
+def test_resolving_every_exception_leaves_the_close_decision_untouched(tmp_path: Path):
+    """The point of the whole layer.
+
+    An investigator marks both E4 exceptions RESOLVED in memory. The close must
+    still be FAIL, the report still blocked, and every control result identical:
+    resolution records what a person did about a failure, never that it passed.
+    """
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"),
+                   dataset_label="E4", write_package=False)
+    )
+    decision_before = copy.deepcopy(result.decision)
+    controls_before = result.control_results.copy()
+    audit_before = copy.deepcopy(result.audit_trail)
+    register_before = copy.deepcopy(result.exception_register)
+
+    register = result.exception_register
+    for entry in register_before["exceptions"]:
+        register = assign_owner(register, entry["exception_id"], "finance.manager")
+        register = transition_exception(
+            register, entry["exception_id"], INVESTIGATING, comment="Reviewing."
+        )
+        register = transition_exception(
+            register, entry["exception_id"], RESOLVED,
+            comment="Investigated and explained.",
+            evidence=[{"type": "control_result", "reference": entry["control_id"]}],
+        )
+
+    # every exception now says RESOLVED
+    assert all(entry["status"] == RESOLVED for entry in register["exceptions"])
+
+    # and none of that reached the close
+    assert result.decision == decision_before
+    assert result.decision["close_status"] == "FAIL"
+    assert result.decision["report_allowed"] is False
+    assert result.decision["blocking_controls"] == ["FXC-03", "FXC-05"]
+    pd.testing.assert_frame_equal(result.control_results, controls_before)
+    assert result.audit_trail == audit_before
+    # the workflow is pure, so the register it was given is also unchanged
+    assert result.exception_register == register_before
+
+
+def test_a_resolved_register_cannot_change_a_written_package(tmp_path: Path):
+    """Writing a package from a fully resolved register must not approve it."""
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"),
+                   dataset_label="E4", write_package=False)
+    )
+    register = result.exception_register
+    for entry in result.exception_register["exceptions"]:
+        register = transition_exception(
+            register, entry["exception_id"], INVESTIGATING, comment="Reviewing."
+        )
+        register = transition_exception(
+            register, entry["exception_id"], RESOLVED, comment="Explained.",
+            evidence=[{"type": "control_result", "reference": entry["control_id"]}],
+        )
+
+    resolved_model = replace(result.model, exception_register=register)
+    written = write_decision_package(resolved_model, tmp_path / "resolved")
+
+    decision = json.loads(written["close_decision"].read_text(encoding="utf-8"))
+    assert decision["close_status"] == "FAIL"
+    assert decision["report_allowed"] is False
+    assert written["report_pdf"].name.startswith("close_exception_report_")
+    assert json.loads(written["audit_trail"].read_text(encoding="utf-8"))[
+        "report_allowed"
+    ] is False
+
+
+# ---------------------------------------------------------------------------
+# 20. manifest and determinism for the register
+# ---------------------------------------------------------------------------
+def test_manifest_hashes_the_exception_register(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    result = run_close(config_for(tmp_path))
+    manifest = json.loads(result.written["package_manifest"].read_text(encoding="utf-8"))
+    by_role = {item["role"]: item for item in manifest["outputs"]}
+
+    assert "exception_register" in by_role
+    assert by_role["exception_register"]["sha256"] == sha256_of(
+        result.written["exception_register"]
+    )
+
+
+def test_tampering_with_the_register_changes_its_recorded_hash(tmp_path: Path):
+    _require(ERR / "fx_rates.csv")
+    baseline = run_close(
+        config_for(tmp_path, fx_rates=ERR / "fx_rates.csv", dataset_label="E4",
+                   write_package=False)
+    )
+    tampered_register = copy.deepcopy(baseline.exception_register)
+    tampered_register["exceptions"][0]["owner"] = "someone.else"
+    tampered_model = replace(baseline.model, exception_register=tampered_register)
+
+    original = write_decision_package(baseline.model, tmp_path / "original")
+    tampered = write_decision_package(tampered_model, tmp_path / "tampered")
+
+    def recorded(paths, role):
+        manifest = json.loads(paths["package_manifest"].read_text(encoding="utf-8"))
+        return {item["role"]: item["sha256"] for item in manifest["outputs"]}[role]
+
+    assert recorded(original, "exception_register") != recorded(tampered, "exception_register")
+    assert recorded(tampered, "exception_register") == sha256_of(tampered["exception_register"])
+    # the rest of the package is untouched by a register-only change
+    for role in ("control_results", "close_decision", "audit_trail", "exceptions"):
+        assert recorded(original, role) == recorded(tampered, role), role
+
+
+def test_the_register_is_byte_identical_across_two_runs(tmp_path: Path):
+    _require(ERR / "fx_rates.csv")
+    common = dict(fx_rates=ERR / "fx_rates.csv", dataset_label="E4")
+    first = run_close(config_for(tmp_path, out_dir=tmp_path / "first", **common)).written
+    second = run_close(config_for(tmp_path, out_dir=tmp_path / "second", **common)).written
+    assert sha256_of(first["exception_register"]) == sha256_of(second["exception_register"])
+
+
+def test_the_register_json_is_written_with_sorted_keys(tmp_path: Path):
+    _require(ERR / "fx_rates.csv")
+    result = run_close(
+        config_for(tmp_path, fx_rates=ERR / "fx_rates.csv", dataset_label="E4")
+    )
+    text = result.written["exception_register"].read_text(encoding="utf-8")
+    top_level = [line.split('"')[1] for line in text.splitlines() if line.startswith('  "')]
+    assert top_level == sorted(top_level)
+    assert text.startswith("{\n  ")
+
+
+def test_report_does_not_construct_the_register_itself():
+    """The writer serialises the register; it must not build or reshape one."""
+    import report
+
+    source = ROOT / "src" / "report.py"
+    assert "exception_workflow" not in _imported_modules(source)
+
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "build_exception_register" not in called
+    assert not hasattr(report, "build_exception_register")
+
+
+def test_a_model_without_a_register_writes_an_empty_one(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    baseline = run_close(config_for(tmp_path, write_package=False))
+    bare = replace(baseline.model, exception_register={})
+    written = write_decision_package(bare, tmp_path / "bare")
+    assert json.loads(written["exception_register"].read_text(encoding="utf-8")) == {}

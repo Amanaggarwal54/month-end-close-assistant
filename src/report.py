@@ -212,6 +212,10 @@ class ReportModel:
     # constructs, filters or re-orders them: it only serialises what it is given.
     audit_trail: dict = field(default_factory=dict)
     exception_records: list[dict] = field(default_factory=list)
+    # Built upstream by exception_workflow.py. Carried here to be serialised and
+    # nothing else: the register records investigation state, and this module
+    # neither constructs it nor lets it reach the close decision it presents.
+    exception_register: dict = field(default_factory=dict)
 
     @property
     def report_allowed(self) -> bool:
@@ -291,6 +295,7 @@ def build_report_model(
     period: str = "January - March 2026",
     audit_trail: dict | None = None,
     exception_records: list[dict] | None = None,
+    exception_register: dict | None = None,
 ) -> ReportModel:
     """Assemble everything the report shows. Pure: no file I/O, no mutation.
 
@@ -509,6 +514,7 @@ def build_report_model(
         inputs=list(inputs or []),
         audit_trail=dict(audit_trail or {}),
         exception_records=list(exception_records or []),
+        exception_register=dict(exception_register or {}),
     )
 
 
@@ -851,7 +857,8 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     """Write the PDF, control results, decision, audit files and manifest.
 
     The audit trail and the exception list are written exactly as ``audit.py``
-    built them; nothing here inspects or reshapes their contents.
+    built them, and the exception register exactly as ``exception_workflow.py``
+    built it; nothing here inspects or reshapes their contents.
     """
     root = assert_writable(Path(out_dir) / slugify(model.dataset_label))
     root.mkdir(parents=True, exist_ok=True)
@@ -862,6 +869,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     json_path = root / "close_decision.json"
     audit_path = root / "audit_trail.json"
     exceptions_path = root / "exceptions.json"
+    register_path = root / "exception_register.json"
     manifest_path = root / "package_manifest.json"
 
     render_pdf(model, pdf_path)
@@ -871,6 +879,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     _write_json(json_path, model.decision, default=str)
     _write_json(audit_path, model.audit_trail)
     _write_json(exceptions_path, model.exception_records)
+    _write_json(register_path, model.exception_register)
 
     outputs = {
         "report_pdf": pdf_path,
@@ -878,6 +887,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
         "close_decision": json_path,
         "audit_trail": audit_path,
         "exceptions": exceptions_path,
+        "exception_register": register_path,
     }
     manifest = {
         "dataset_label": model.dataset_label,

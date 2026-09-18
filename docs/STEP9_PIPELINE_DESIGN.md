@@ -51,6 +51,7 @@ data/error_data ───────►│  load_artefacts()   I/O: read the CS
                         │        │  controls.decide_close                 │
                         │        │  audit.build_exception_records         │
                         │        │  audit.build_audit_trail               │
+                        │        │  exception_workflow.build_register      │
                         │        │  report.build_report_model             │
                         │        ▼                                        │
                         │  write_outputs()    I/O: report.write_package   │
@@ -94,6 +95,7 @@ class CloseRunResult:
     decision: dict
     exception_records: list[dict]  # built by audit.py, carried to the package
     audit_trail: dict              # built by audit.py, carried to the package
+    exception_register: dict       # built by exception_workflow.py, carried to the package
     model: ReportModel
     written: dict[str, Path]       # empty when write_package is False
     exit_code: int                 # 0 allowed, 2 blocked
@@ -210,7 +212,7 @@ explanation, so the terminal tells you what broke without opening the PDF. On a
 | 3 | E5 blocked | `exit_code 2`, `ICO-01` among blocking controls |
 | 4 | E6 blocked | `exit_code 2`, `ICO-03` among blocking controls |
 | 5 | E1/E2/E3 blocked | `exit_code 2`, blocking set is `{MAT-03, MAT-04, MAT-06}` |
-| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `audit_trail.json`, `exceptions.json`, `package_manifest.json` all present under `out/<label>/` |
+| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `audit_trail.json`, `exceptions.json`, `exception_register.json`, `package_manifest.json` all present under `out/<label>/` |
 | 7 | **Parity with direct module use** | run the modules by hand with the same fixed timestamp, then run the pipeline; assert the SHA-256 of the PDF, CSV and JSON match. This is requirement 10, tested rather than asserted in prose |
 | 8 | Source protection | `out_dir=data/raw` raises `ProtectedPathError` and the CLI returns 1 |
 | 9 | No mutation | SHA-256 of every file under `data/raw` unchanged after a full run; input DataFrames unchanged |
@@ -317,3 +319,45 @@ Serialisation is `indent=2`, `sort_keys=True`, UTF-8. Sorting fixes the key
 order; list order is left alone, so the exception ordering `audit.py` already
 determined is what reaches disk. `package_manifest.json` hashes both new files
 and still excludes itself.
+
+---
+
+## 13. Amendment (Step 12B): the exception register in the package
+
+After building the audit trail, the pipeline calls
+`exception_workflow.build_exception_register(exception_records, dataset_label)`
+and carries the result into the report model. The package therefore contains
+seven artefacts:
+
+```
+out/<dataset_label>/
+├── close_report_<label>_<stamp>.pdf   (or close_exception_report_… when blocked)
+├── control_results.csv
+├── close_decision.json
+├── audit_trail.json
+├── exceptions.json
+├── exception_register.json   one OPEN investigation record per audit exception
+└── package_manifest.json
+```
+
+**The register is downstream of the decision and never flows back into it.** The
+order in `execute_close` is deliberate: `run_controls` → `decide_close` →
+`build_exception_records` → `build_audit_trail` → `build_exception_register`.
+Nothing after `decide_close` is read by it, so a resolution status cannot turn a
+FAIL into a PASS, cannot alter `control_results.csv`, `audit_trail.json` or
+`close_decision.json`, and cannot change `report_allowed`. Two tests hold that
+line: one resolves every E4 exception in memory and asserts the decision, the
+control results and the audit trail are all unchanged; one writes a package from
+a fully resolved register and asserts the decision file still says FAIL and the
+document is still the exception report.
+
+The source of truth for control failures remains
+`control_results → decide_close → audit_trail/exceptions`. The register opens a
+record per audit exception and preserves each one under `source_exception`; it
+does not discover failures of its own.
+
+`exception_workflow.py` stays pure: standard library only, no file I/O, no
+imports of `audit`, `controls`, `match`, `intercompany`, `report` or `pipeline`,
+and no generated timestamps. The pipeline calls it; `report.py` only serialises
+what it is handed, and a test asserts `report.py` neither imports the module nor
+calls the builder.
