@@ -34,6 +34,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from audit import build_audit_trail, build_exception_records  # noqa: E402
 from controls import ControlConfig, decide_close, run_controls  # noqa: E402
 from intercompany import check_elimination, generate_intercompany_entries  # noqa: E402
 from match import three_way_match  # noqa: E402
@@ -121,6 +122,8 @@ class CloseRunResult:
     decision: dict
     model: ReportModel
     run_timestamp: str
+    exception_records: list[dict] = field(default_factory=list)
+    audit_trail: dict = field(default_factory=dict)
     written: dict[str, Path] = field(default_factory=dict)
 
     @property
@@ -210,6 +213,14 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
         dataset_label=config.dataset_label,
         run_timestamp=timestamp,
     )
+    # The audit layer runs between the decision and the report: audit.py is the
+    # only module that decides what an exception record looks like, and the
+    # report receives the finished objects rather than deriving its own.
+    exception_records = build_exception_records(control_results)
+    audit_trail = build_audit_trail(
+        control_results, decision, exception_records=exception_records
+    )
+
     model = build_report_model(
         match_results=match_results,
         invoices=sources.invoices,
@@ -223,6 +234,8 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
         decision=decision,
         inputs=sources.inputs,
         max_exception_rows=config.max_exception_rows,
+        audit_trail=audit_trail,
+        exception_records=exception_records,
     )
     return CloseRunResult(
         config=config,
@@ -231,6 +244,8 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
         decision=decision,
         model=model,
         run_timestamp=timestamp,
+        exception_records=exception_records,
+        audit_trail=audit_trail,
     )
 
 

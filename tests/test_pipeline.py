@@ -8,7 +8,9 @@ produced by the pipeline. Everything else is exit codes, safety and determinism.
 from __future__ import annotations
 
 import ast
+import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import pipeline  # noqa: E402
+from audit import build_audit_trail, build_exception_records  # noqa: E402
 from controls import decide_close, run_controls  # noqa: E402
 from intercompany import check_elimination, generate_intercompany_entries  # noqa: E402
 from match import three_way_match  # noqa: E402
@@ -38,7 +41,17 @@ RAW = ROOT / "data" / "raw"
 ERR = ROOT / "data" / "error_data"
 FIXED_TIMESTAMP = "2026-03-31T18:00:00Z"
 
-PACKAGE_FILES = ["control_results.csv", "close_decision.json", "package_manifest.json"]
+PACKAGE_FILES = [
+    "control_results.csv",
+    "close_decision.json",
+    "audit_trail.json",
+    "exceptions.json",
+    "package_manifest.json",
+]
+PACKAGE_ROLES = (
+    "report_pdf", "control_results", "close_decision",
+    "audit_trail", "exceptions", "package_manifest",
+)
 
 
 def _require(path: Path) -> Path:
@@ -176,16 +189,20 @@ def test_pipeline_package_is_identical_to_running_the_modules_directly(tmp_path:
         dataset_label="clean", run_timestamp=FIXED_TIMESTAMP,
     )
     decision = decide_close(results, dataset_label="clean", run_timestamp=FIXED_TIMESTAMP)
+    exception_records = build_exception_records(results)
+    audit_trail = build_audit_trail(results, decision, exception_records=exception_records)
     model = build_report_model(
         match_results=match_results, invoices=invoices, payments=payments,
         ic_entries=entries, ic_elimination=elimination, shared_costs=shared_costs,
         fx_actual=fx_actual, fx_reference=fx_reference, control_results=results,
         decision=decision, inputs=describe_inputs(paths), max_exception_rows=25,
+        audit_trail=audit_trail, exception_records=exception_records,
     )
     manual = write_decision_package(model, tmp_path / "manual")
     piped = run_close(config_for(tmp_path, out_dir=tmp_path / "piped")).written
 
-    for role in ("report_pdf", "control_results", "close_decision", "package_manifest"):
+    assert set(manual) == set(piped) == set(PACKAGE_ROLES)
+    for role in PACKAGE_ROLES:
         assert manual[role].name == piped[role].name, role
         if role == "package_manifest":
             continue  # the manifest records its own directory, which differs
@@ -298,7 +315,7 @@ def test_dry_run_still_returns_a_full_result(tmp_path: Path):
 # 13. structure guard: the orchestration layer stays an orchestration layer
 # ---------------------------------------------------------------------------
 ALLOWED_PROJECT_IMPORTS = {
-    "match", "intercompany", "controls", "report", "plant_downstream_errors",
+    "match", "intercompany", "controls", "report", "audit", "plant_downstream_errors",
 }
 ALLOWED_THIRD_PARTY = {"pandas"}
 
@@ -333,10 +350,234 @@ def test_pipeline_imports_its_accounting_work_and_defines_none_of_it():
 def test_pipeline_delegates_every_accounting_step():
     """Each step of the close must be a call into an existing module."""
     for name in ("three_way_match", "generate_intercompany_entries", "check_elimination",
-                 "run_controls", "decide_close", "build_report_model",
-                 "write_decision_package"):
+                 "run_controls", "decide_close", "build_exception_records",
+                 "build_audit_trail", "build_report_model", "write_decision_package"):
         attribute = getattr(pipeline, name, None)
         assert attribute is not None, f"pipeline does not use {name}"
         assert attribute.__module__ != "pipeline", (
             f"{name} is defined in pipeline.py; it must come from the module that owns it"
         )
+
+
+# ---------------------------------------------------------------------------
+# 14. the audit artefacts in the decision package (Step 11B)
+# ---------------------------------------------------------------------------
+def _package(tmp_path: Path, name: str = "run", **overrides):
+    """Run the close and return (result, package paths, loaded json)."""
+    result = run_close(config_for(tmp_path, out_dir=tmp_path / name, **overrides))
+    written = result.written
+    loaded = {
+        "audit": json.loads(written["audit_trail"].read_text(encoding="utf-8")),
+        "exceptions": json.loads(written["exceptions"].read_text(encoding="utf-8")),
+        "manifest": json.loads(written["package_manifest"].read_text(encoding="utf-8")),
+    }
+    return result, written, loaded
+
+
+def test_clean_package_contains_the_audit_artefacts(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    _, written, _ = _package(tmp_path)
+    assert written["audit_trail"].name == "audit_trail.json"
+    assert written["exceptions"].name == "exceptions.json"
+    assert written["audit_trail"].exists() and written["exceptions"].exists()
+
+
+def test_clean_exceptions_file_is_an_empty_list(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    _, _, loaded = _package(tmp_path)
+    assert loaded["exceptions"] == []
+
+
+def test_clean_audit_trail_reports_pass_and_no_exceptions(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    _, _, loaded = _package(tmp_path)
+    audit = loaded["audit"]
+    assert audit["close_status"] == "PASS"
+    assert audit["report_allowed"] is True
+    assert audit["exception_count"] == 0
+    assert audit["exceptions"] == []
+    assert audit["blocking_controls"] == []
+    assert audit["critical_failed_count"] == 0
+
+
+def test_e4_package_carries_exactly_the_two_fx_exceptions(tmp_path: Path):
+    _, _, loaded = _package(
+        tmp_path, "e4", fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4"
+    )
+    assert [record["check_id"] for record in loaded["exceptions"]] == ["FXC-03", "FXC-05"]
+    for record in loaded["exceptions"]:
+        assert record["control_family"] == "SOURCE_ACCURACY"
+        assert record["error_reference"] == "E4"
+
+
+def test_e4_audit_trail_reports_fail_and_blocks_the_report(tmp_path: Path):
+    _, _, loaded = _package(
+        tmp_path, "e4", fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4"
+    )
+    audit = loaded["audit"]
+    assert audit["close_status"] == "FAIL"
+    assert audit["report_allowed"] is False
+    assert audit["blocking_controls"] == ["FXC-03", "FXC-05"]
+    assert audit["exception_count"] == 2
+    assert audit["critical_failed_count"] == 2
+
+
+def test_e1_to_e3_package_carries_the_matching_exceptions(tmp_path: Path):
+    _require(ERR / "invoices.csv")
+    _, _, loaded = _package(
+        tmp_path, "e13", data_dir=ERR, fx_rates=RAW / "fx_rates.csv", dataset_label="E1-E3"
+    )
+    assert [record["check_id"] for record in loaded["exceptions"]] == [
+        "MAT-03", "MAT-04", "MAT-06"
+    ]
+    assert loaded["audit"]["blocking_controls"] == ["MAT-03", "MAT-04", "MAT-06"]
+
+
+def test_the_embedded_and_standalone_exception_lists_agree(tmp_path: Path):
+    """audit_trail.json embeds the exceptions that exceptions.json holds flat.
+
+    Both come from the same object in one call, so they cannot drift; this test
+    is what keeps that true if either write path is changed later.
+    """
+    _, _, loaded = _package(
+        tmp_path, "e4", fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4"
+    )
+    assert loaded["audit"]["exceptions"] == loaded["exceptions"]
+
+
+def test_the_result_object_exposes_the_same_audit_data_that_was_written(tmp_path: Path):
+    result, _, loaded = _package(
+        tmp_path, "e4", fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4"
+    )
+    assert result.audit_trail == loaded["audit"]
+    assert result.exception_records == loaded["exceptions"]
+    assert result.model.audit_trail == loaded["audit"]
+
+
+# ---------------------------------------------------------------------------
+# 15. manifest coverage of the audit artefacts
+# ---------------------------------------------------------------------------
+def test_manifest_hashes_both_new_json_files(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    _, written, loaded = _package(tmp_path)
+    by_role = {item["role"]: item for item in loaded["manifest"]["outputs"]}
+
+    assert {"audit_trail", "exceptions"} <= set(by_role)
+    for role in ("audit_trail", "exceptions"):
+        assert by_role[role]["sha256"] == sha256_of(written[role]), role
+
+
+def test_manifest_still_excludes_itself_and_keeps_its_hash_scope(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    _, written, loaded = _package(tmp_path)
+    manifest = loaded["manifest"]
+
+    names = {Path(item["path"]).name for item in manifest["outputs"]}
+    assert written["package_manifest"].name not in names
+    assert "except" in manifest["hash_scope"]
+    for item in manifest["outputs"]:
+        assert item["sha256"] == sha256_of(Path(item["path"]))
+
+
+def test_changing_the_audit_output_changes_its_recorded_hash(tmp_path: Path):
+    """The manifest hash must track the audit content, not just its presence."""
+    _require(RAW / "invoices.csv")
+    baseline = run_close(config_for(tmp_path, out_dir=tmp_path / "a", write_package=False))
+
+    tampered_trail = dict(baseline.audit_trail)
+    tampered_trail["exception_count"] = 99
+    tampered_model = replace(baseline.model, audit_trail=tampered_trail)
+
+    original = write_decision_package(baseline.model, tmp_path / "original")
+    tampered = write_decision_package(tampered_model, tmp_path / "tampered")
+
+    def recorded(paths, role):
+        manifest = json.loads(paths["package_manifest"].read_text(encoding="utf-8"))
+        return {item["role"]: item["sha256"] for item in manifest["outputs"]}[role]
+
+    assert recorded(original, "audit_trail") != recorded(tampered, "audit_trail")
+    assert recorded(original, "audit_trail") == sha256_of(original["audit_trail"])
+    assert recorded(tampered, "audit_trail") == sha256_of(tampered["audit_trail"])
+    # the rest of the package is untouched by an audit-only change
+    assert recorded(original, "control_results") == recorded(tampered, "control_results")
+
+
+# ---------------------------------------------------------------------------
+# 16. determinism across every artefact
+# ---------------------------------------------------------------------------
+def test_every_package_artefact_is_byte_identical_across_two_runs(tmp_path: Path):
+    _require(ERR / "fx_rates.csv")
+    common = dict(fx_rates=ERR / "fx_rates.csv", dataset_label="E4")
+    first = run_close(config_for(tmp_path, out_dir=tmp_path / "first", **common)).written
+    second = run_close(config_for(tmp_path, out_dir=tmp_path / "second", **common)).written
+
+    for role in PACKAGE_ROLES:
+        if role == "package_manifest":
+            continue  # records its own directory, which differs between runs
+        assert sha256_of(first[role]) == sha256_of(second[role]), role
+
+
+def test_the_audit_json_is_written_with_sorted_keys(tmp_path: Path):
+    """Key order is what makes the file byte-stable, so assert it on disk."""
+    _require(ERR / "fx_rates.csv")
+    _, written, _ = _package(
+        tmp_path, "e4", fx_rates=ERR / "fx_rates.csv", dataset_label="E4"
+    )
+    text = written["audit_trail"].read_text(encoding="utf-8")
+    top_level = [
+        line.split('"')[1]
+        for line in text.splitlines()
+        if line.startswith('  "')
+    ]
+    assert top_level == sorted(top_level)
+    assert text.startswith("{\n  ")  # indent=2
+
+
+def test_exception_order_on_disk_matches_the_order_audit_py_produced(tmp_path: Path):
+    _require(ERR / "invoices.csv")
+    result, _, loaded = _package(
+        tmp_path, "e13", data_dir=ERR, fx_rates=RAW / "fx_rates.csv", dataset_label="E1-E3"
+    )
+    on_disk = [record["check_id"] for record in loaded["exceptions"]]
+    in_memory = [record["check_id"] for record in build_exception_records(result.control_results)]
+    assert on_disk == in_memory
+
+
+# ---------------------------------------------------------------------------
+# 17. the audit layer stays upstream of presentation
+# ---------------------------------------------------------------------------
+def test_report_does_not_build_audit_data_itself():
+    """report.py may serialise audit data, never construct it.
+
+    A presentation layer that re-derived the exception list could disagree with
+    the audit file written beside it, which is the one inconsistency this
+    package must not be able to contain.
+    """
+    import report
+
+    source = ROOT / "src" / "report.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    imported = _imported_modules(source)
+    assert "audit" not in imported, "report.py must not import the audit module"
+
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "build_audit_trail" not in called
+    assert "build_exception_records" not in called
+    assert not hasattr(report, "build_audit_trail")
+    assert not hasattr(report, "build_exception_records")
+
+
+def test_audit_construction_happens_in_the_pipeline_not_the_writer(tmp_path: Path):
+    """A model with no audit data writes empty audit files rather than making some."""
+    _require(RAW / "invoices.csv")
+    baseline = run_close(config_for(tmp_path, write_package=False))
+    bare = replace(baseline.model, audit_trail={}, exception_records=[])
+    written = write_decision_package(bare, tmp_path / "bare")
+
+    assert json.loads(written["audit_trail"].read_text(encoding="utf-8")) == {}
+    assert json.loads(written["exceptions"].read_text(encoding="utf-8")) == []

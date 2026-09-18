@@ -208,6 +208,10 @@ class ReportModel:
     fx_control_summary: list[dict]
     control_results_records: list[dict] = field(default_factory=list)
     inputs: list[dict] = field(default_factory=list)
+    # Built upstream by audit.py and carried here unchanged. This module never
+    # constructs, filters or re-orders them: it only serialises what it is given.
+    audit_trail: dict = field(default_factory=dict)
+    exception_records: list[dict] = field(default_factory=list)
 
     @property
     def report_allowed(self) -> bool:
@@ -285,8 +289,17 @@ def build_report_model(
     inputs: list[dict] | None = None,
     max_exception_rows: int = 25,
     period: str = "January - March 2026",
+    audit_trail: dict | None = None,
+    exception_records: list[dict] | None = None,
 ) -> ReportModel:
-    """Assemble everything the report shows. Pure: no file I/O, no mutation."""
+    """Assemble everything the report shows. Pure: no file I/O, no mutation.
+
+    ``audit_trail`` and ``exception_records`` are built upstream by ``audit.py``
+    and carried through untouched. This module deliberately does not build them:
+    deciding what counts as an exception is an audit concern, and a presentation
+    layer that re-derived it could disagree with the audit file written beside
+    the report.
+    """
     results = control_results.copy()
     entries = ic_entries.copy()
     accounting = entries[entries["entry_type"].isin(["RECEIVABLE", "PAYABLE"])]
@@ -494,6 +507,8 @@ def build_report_model(
         fx_control_summary=fx_controls,
         control_results_records=results.fillna("").to_dict(orient="records"),
         inputs=list(inputs or []),
+        audit_trail=dict(audit_trail or {}),
+        exception_records=list(exception_records or []),
     )
 
 
@@ -819,8 +834,25 @@ def render_pdf(model: ReportModel, path: str | Path) -> Path:
 # ---------------------------------------------------------------------------
 # decision package
 # ---------------------------------------------------------------------------
+def _write_json(path: Path, payload: Any, *, default=None) -> Path:
+    """Serialise deterministically: sorted keys, two-space indent, UTF-8.
+
+    List order is preserved, so the exception ordering that ``audit.py`` already
+    fixed is what reaches disk.
+    """
+    destination = assert_writable(path)
+    destination.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=default), encoding="utf-8"
+    )
+    return destination
+
+
 def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> dict[str, Path]:
-    """Write the PDF, control results, decision and manifest into out/<label>/."""
+    """Write the PDF, control results, decision, audit files and manifest.
+
+    The audit trail and the exception list are written exactly as ``audit.py``
+    built them; nothing here inspects or reshapes their contents.
+    """
     root = assert_writable(Path(out_dir) / slugify(model.dataset_label))
     root.mkdir(parents=True, exist_ok=True)
 
@@ -828,15 +860,25 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     pdf_path = root / f"{model.filename_stem}_{stamp}.pdf"
     csv_path = root / "control_results.csv"
     json_path = root / "close_decision.json"
+    audit_path = root / "audit_trail.json"
+    exceptions_path = root / "exceptions.json"
     manifest_path = root / "package_manifest.json"
 
     render_pdf(model, pdf_path)
     pd.DataFrame(model.control_results_records).to_csv(assert_writable(csv_path), index=False)
-    assert_writable(json_path).write_text(
-        json.dumps(model.decision, indent=2, sort_keys=True, default=str), encoding="utf-8"
-    )
+    # default=str covers config_used, which can carry non-JSON scalars; the audit
+    # files need no fallback, because audit.py guarantees plain Python values.
+    _write_json(json_path, model.decision, default=str)
+    _write_json(audit_path, model.audit_trail)
+    _write_json(exceptions_path, model.exception_records)
 
-    outputs = {"report_pdf": pdf_path, "control_results": csv_path, "close_decision": json_path}
+    outputs = {
+        "report_pdf": pdf_path,
+        "control_results": csv_path,
+        "close_decision": json_path,
+        "audit_trail": audit_path,
+        "exceptions": exceptions_path,
+    }
     manifest = {
         "dataset_label": model.dataset_label,
         "run_timestamp": model.run_timestamp,
@@ -854,9 +896,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
             for role, path in sorted(outputs.items())
         ],
     }
-    assert_writable(manifest_path).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _write_json(manifest_path, manifest)
     outputs["package_manifest"] = manifest_path
     return outputs
 

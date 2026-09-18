@@ -49,6 +49,8 @@ data/error_data ───────►│  load_artefacts()   I/O: read the CS
                         │        │  intercompany.check_elimination        │
                         │        │  controls.run_controls                 │
                         │        │  controls.decide_close                 │
+                        │        │  audit.build_exception_records         │
+                        │        │  audit.build_audit_trail               │
                         │        │  report.build_report_model             │
                         │        ▼                                        │
                         │  write_outputs()    I/O: report.write_package   │
@@ -90,6 +92,8 @@ class CloseRunResult:
     artefacts: CloseArtefacts      # match_results, ic_entries, ic_elimination, sources
     control_results: pd.DataFrame
     decision: dict
+    exception_records: list[dict]  # built by audit.py, carried to the package
+    audit_trail: dict              # built by audit.py, carried to the package
     model: ReportModel
     written: dict[str, Path]       # empty when write_package is False
     exit_code: int                 # 0 allowed, 2 blocked
@@ -206,7 +210,7 @@ explanation, so the terminal tells you what broke without opening the PDF. On a
 | 3 | E5 blocked | `exit_code 2`, `ICO-01` among blocking controls |
 | 4 | E6 blocked | `exit_code 2`, `ICO-03` among blocking controls |
 | 5 | E1/E2/E3 blocked | `exit_code 2`, blocking set is `{MAT-03, MAT-04, MAT-06}` |
-| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `package_manifest.json` all present under `out/<label>/` |
+| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `audit_trail.json`, `exceptions.json`, `package_manifest.json` all present under `out/<label>/` |
 | 7 | **Parity with direct module use** | run the modules by hand with the same fixed timestamp, then run the pipeline; assert the SHA-256 of the PDF, CSV and JSON match. This is requirement 10, tested rather than asserted in prose |
 | 8 | Source protection | `out_dir=data/raw` raises `ProtectedPathError` and the CLI returns 1 |
 | 9 | No mutation | SHA-256 of every file under `data/raw` unchanged after a full run; input DataFrames unchanged |
@@ -272,3 +276,44 @@ This is a second edit inside Step 8, beyond the approved `__main__` delegation.
 It is one function, the hashes and roles are unchanged, and the alternative
 (resolving every path to absolute inside the pipeline) would have put developer
 directory names into the example PDFs.
+
+---
+
+## 12. Amendment (Step 11B): the audit artefacts in the package
+
+The pipeline now calls `audit.build_exception_records()` and
+`audit.build_audit_trail()` between `decide_close()` and `build_report_model()`,
+and carries both objects into the report model. The package therefore contains
+six artefacts rather than four:
+
+```
+out/<dataset_label>/
+├── close_report_<label>_<stamp>.pdf   (or close_exception_report_… when blocked)
+├── control_results.csv
+├── close_decision.json
+├── audit_trail.json        summary counts, the close verdict, and the exceptions
+├── exceptions.json         the same exception records as a flat list
+└── package_manifest.json
+```
+
+`audit_trail.json` embeds the exception list that `exceptions.json` holds flat.
+The duplication is deliberate: the trail is self-contained for a reader who is
+handed only that file, while the flat list is the convenient shape for tooling.
+Both are written from one object in one call, so they cannot disagree, and a
+test asserts they match.
+
+**Where the boundary sits.** `audit.py` is the only module that decides what an
+exception record contains or how the records are ordered. `report.py` receives
+the finished objects on the report model and serialises them; it does not import
+`audit`, does not call either builder, and does not inspect the control results
+to work out what an exception is. A presentation layer that re-derived the
+exception list could disagree with the audit file written beside it, which is
+the one inconsistency this package must not be able to contain. Two tests hold
+that line: one parses `report.py` and asserts neither builder is imported or
+called, and one writes a package from a model carrying no audit data and asserts
+the files come out empty rather than being reconstructed.
+
+Serialisation is `indent=2`, `sort_keys=True`, UTF-8. Sorting fixes the key
+order; list order is left alone, so the exception ordering `audit.py` already
+determined is what reaches disk. `package_manifest.json` hashes both new files
+and still excludes itself.
