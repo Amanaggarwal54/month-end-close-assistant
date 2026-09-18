@@ -861,13 +861,28 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     return outputs
 
 
+def display_path(path: str | Path) -> str:
+    """Path as shown in the provenance appendix.
+
+    Rendered relative to the working directory when the file sits under it, so
+    two callers that name the same file differently (one absolute, one relative)
+    produce identical documents - and so a committed example report does not
+    carry the author's home directory.
+    """
+    candidate = Path(path)
+    try:
+        return Path(candidate).resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return candidate.resolve().as_posix()
+
+
 def describe_inputs(paths: dict[str, str | Path]) -> list[dict]:
     """Role, path and SHA-256 for every input file, for the provenance appendix."""
     described: list[dict] = []
     for role, path in sorted(paths.items()):
         candidate = Path(path)
         if candidate.exists():
-            described.append({"role": role, "path": str(candidate),
+            described.append({"role": role, "path": display_path(candidate),
                               "sha256": sha256_of(candidate)})
     return described
 
@@ -876,106 +891,12 @@ def describe_inputs(paths: dict[str, str | Path]) -> list[dict]:
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
+    # The orchestration lives in pipeline.py, which is the single implementation
+    # of the close sequence. This entry point delegates to it so the two CLIs
+    # cannot drift apart and both produce an identical decision package.
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from controls import decide_close, run_controls  # noqa: E402
-    from intercompany import check_elimination, generate_intercompany_entries  # noqa: E402
-    from match import three_way_match  # noqa: E402
+    from pipeline import main  # noqa: E402
 
-    parser = argparse.ArgumentParser(description="Produce the close report and decision package.")
-    parser.add_argument("--data-dir", default="data/raw")
-    parser.add_argument("--fx-rates", default=None, help="FX file under test (E4 run)")
-    parser.add_argument("--fx-reference", default=None,
-                        help="default data/raw/fx_rates_expected.csv")
-    parser.add_argument("--ic-entries", default=None,
-                        help="pre-generated intercompany entries (E5/E6 runs)")
-    parser.add_argument("--dataset-label", default="clean")
-    parser.add_argument("--out-dir", default="out")
-    parser.add_argument("--run-timestamp", default=None,
-                        help="UTC timestamp; fixing it makes the output byte-identical")
-    parser.add_argument("--max-exception-rows", type=int, default=25)
-    parser.add_argument("--fail-on-blocked", dest="fail_on_blocked", action="store_true",
-                        default=True)
-    parser.add_argument("--no-fail-on-blocked", dest="fail_on_blocked", action="store_false")
-    args = parser.parse_args()
-
-    try:
-        base = Path(args.data_dir)
-        paths = {
-            "purchase_orders": base / "purchase_orders.csv",
-            "invoices": base / "invoices.csv",
-            "payments": base / "payments.csv",
-            "shared_costs": base / "shared_costs.csv",
-            "fx_rates": Path(args.fx_rates) if args.fx_rates else base / "fx_rates.csv",
-            "fx_reference": Path(args.fx_reference) if args.fx_reference
-            else Path("data/raw/fx_rates_expected.csv"),
-        }
-        if args.ic_entries:
-            paths["intercompany_entries"] = Path(args.ic_entries)
-
-        read = lambda p: pd.read_csv(p, dtype=str)  # noqa: E731
-        pos_df = read(paths["purchase_orders"])
-        invoices_df = read(paths["invoices"])
-        payments_df = read(paths["payments"])
-        costs_df = read(paths["shared_costs"])
-        fx_df = read(paths["fx_rates"])
-        fx_reference_df = read(paths["fx_reference"])
-
-        match_df = three_way_match(pos_df, invoices_df, payments_df)
-        entries_df = (
-            pd.read_csv(paths["intercompany_entries"])
-            if args.ic_entries
-            else generate_intercompany_entries(costs_df, fx_df)
-        )
-        elimination_df = check_elimination(entries_df)
-
-        timestamp = args.run_timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds")
-        results_df = run_controls(
-            match_results=match_df,
-            invoices=invoices_df,
-            payments=payments_df,
-            ic_entries=entries_df,
-            ic_elimination=elimination_df,
-            shared_costs=costs_df,
-            fx_actual=fx_df,
-            fx_reference=fx_reference_df,
-            purchase_orders=pos_df,
-            dataset_label=args.dataset_label,
-            run_timestamp=timestamp,
-        )
-        decision = decide_close(results_df, dataset_label=args.dataset_label,
-                                run_timestamp=timestamp)
-
-        model = build_report_model(
-            match_results=match_df,
-            invoices=invoices_df,
-            payments=payments_df,
-            ic_entries=entries_df,
-            ic_elimination=elimination_df,
-            shared_costs=costs_df,
-            fx_actual=fx_df,
-            fx_reference=fx_reference_df,
-            control_results=results_df,
-            decision=decision,
-            inputs=describe_inputs(paths),
-            max_exception_rows=args.max_exception_rows,
-        )
-        written = write_decision_package(model, args.out_dir)
-
-        print(f"\nDataset:        {model.dataset_label}")
-        print(f"Close status:   {decision['close_status']}  (report_allowed="
-              f"{str(model.report_allowed).lower()})")
-        if decision["blocking_controls"]:
-            print(f"Blocking:       {', '.join(decision['blocking_controls'])}")
-        print(f"Document:       {written['report_pdf']}")
-        print(f"Package:        {written['package_manifest'].parent}")
-
-        sys.exit(2 if args.fail_on_blocked and not model.report_allowed else 0)
-    except ProtectedPathError as exc:
-        print(f"Refused: {exc}")
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001 - CLI boundary
-        print(f"{type(exc).__name__}: {exc}")
-        sys.exit(1)
+    sys.exit(main())

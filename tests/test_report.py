@@ -343,7 +343,8 @@ def test_decision_package_contains_every_artefact_with_matching_hashes(tmp_path:
 
     assert manifest["inputs"], "the provenance appendix needs input hashes"
     for item in manifest["inputs"]:
-        assert item["sha256"] == sha256_of(item["path"])
+        # paths are stored relative to the working directory for portability
+        assert item["sha256"] == sha256_of(Path(item["path"]))
 
     for item in manifest["outputs"]:
         if Path(item["path"]).name != written["package_manifest"].name:
