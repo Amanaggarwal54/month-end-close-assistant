@@ -1,5 +1,7 @@
 ﻿# Month-End Close Assistant
 
+[![Tests](https://github.com/Amanaggarwal54/month-end-close-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/Amanaggarwal54/month-end-close-assistant/actions/workflows/tests.yml)
+
 Synthetic finance automation project for a three-entity month-end close.
 
 ## Current scope
