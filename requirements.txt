@@ -1,5 +1,5 @@
 pandas>=2.2
 numpy>=2.0
-reportlab>=4.0
+reportlab==5.0.1
 pdfplumber>=0.11
 pytest>=8.0

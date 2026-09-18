@@ -6,3 +6,5 @@ __pycache__/
 
 data/raw/close_decision.json
 data/raw/control_results.csv
+
+out/
