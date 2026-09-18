@@ -132,6 +132,30 @@ def _unique_exception_ids(
     return result
 
 
+def _check_occurred_at(occurred_at: str | None) -> str | None:
+    """
+    Validate a caller-supplied event timestamp and return it verbatim.
+
+    The workflow never reads a clock: every timestamp arrives from the caller,
+    so identical inputs always produce an identical register. The value is
+    stored exactly as given - not parsed, normalised or reformatted - because
+    the caller's own format is the record.
+
+    Only the type is checked. A non-string would survive in memory and then
+    fail much later when the register is serialised into the close package, far
+    from the call that introduced it.
+    """
+    if occurred_at is None:
+        return None
+
+    if not isinstance(occurred_at, str) or not occurred_at.strip():
+        raise ValueError(
+            "occurred_at must be a non-empty string or None."
+        )
+
+    return occurred_at
+
+
 def _first_present(
     exception: dict[str, Any],
     *field_names: str,
@@ -184,6 +208,8 @@ def _validate_source_exception(exception: dict[str, Any]) -> None:
 def build_exception_register(
     exception_records: Iterable[dict[str, Any]],
     dataset_label: str,
+    *,
+    occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the initial exception register from audit exception records.
@@ -192,10 +218,14 @@ def build_exception_register(
     control evidence remains available and cannot be silently changed.
 
     No timestamps are generated here because generated timestamps would make
-    identical inputs produce different outputs.
+    identical inputs produce different outputs. ``occurred_at`` stamps the
+    CREATED history event when the caller chooses to supply one, and stays
+    None otherwise; nothing is invented on the caller's behalf.
     """
     if not isinstance(dataset_label, str) or not dataset_label.strip():
         raise ValueError("dataset_label must be a non-empty string.")
+
+    occurred_at = _check_occurred_at(occurred_at)
 
     source = [deepcopy(_require_mapping(item, "exception_record"))
               for item in exception_records]
@@ -236,6 +266,7 @@ def build_exception_register(
                         "comment": None,
                         "owner": None,
                         "evidence": [],
+                        "occurred_at": occurred_at,
                     }
                 ],
             }
@@ -278,16 +309,21 @@ def assign_owner(
     owner: str | None,
     *,
     comment: str | None = None,
+    occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """
     Assign or clear an owner.
 
     Owner changes are recorded in history but do not change exception status.
+    ``occurred_at`` is supplied by the caller and stored verbatim on the
+    history event, so a reviewer can see when ownership moved.
     """
     if owner is not None:
         if not isinstance(owner, str) or not owner.strip():
             raise ValueError("owner must be a non-empty string or None.")
         owner = owner.strip()
+
+    occurred_at = _check_occurred_at(occurred_at)
 
     updated = _copy_register(register)
     exception = _find_exception(updated, exception_id)
@@ -304,6 +340,7 @@ def assign_owner(
             "owner": owner,
             "previous_owner": previous_owner,
             "evidence": [],
+            "occurred_at": occurred_at,
         }
     )
 
@@ -317,6 +354,7 @@ def transition_exception(
     *,
     comment: str | None = None,
     evidence: list[dict[str, Any]] | None = None,
+    occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """
     Move an exception through the allowed lifecycle.
@@ -331,6 +369,12 @@ def transition_exception(
     RESOLVED requires:
         - a non-empty comment
         - at least one evidence reference
+
+    ``occurred_at`` is supplied by the caller and stored verbatim on the
+    history event. It is deliberately not copied into ``resolution``: the
+    resolution records what was concluded and on what evidence, while when it
+    happened belongs to the event log, and duplicating it would create two
+    places that could disagree.
     """
     if new_status not in VALID_STATUSES:
         raise ValueError(
@@ -344,6 +388,8 @@ def transition_exception(
                 "comment must be a non-empty string or None."
             )
         comment = comment.strip()
+
+    occurred_at = _check_occurred_at(occurred_at)
 
     if evidence is None:
         evidence = []
@@ -412,6 +458,7 @@ def transition_exception(
             "comment": comment,
             "owner": exception["owner"],
             "evidence": evidence_copy,
+            "occurred_at": occurred_at,
         }
     )
 

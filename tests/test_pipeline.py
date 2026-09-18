@@ -200,7 +200,10 @@ def test_pipeline_package_is_identical_to_running_the_modules_directly(tmp_path:
     decision = decide_close(results, dataset_label="clean", run_timestamp=FIXED_TIMESTAMP)
     exception_records = build_exception_records(results)
     audit_trail = build_audit_trail(results, decision, exception_records=exception_records)
-    exception_register = build_exception_register(exception_records, "clean")
+    # mirrors what the pipeline does, including the creation timestamp
+    exception_register = build_exception_register(
+        exception_records, "clean", occurred_at=FIXED_TIMESTAMP
+    )
     model = build_report_model(
         match_results=match_results, invoices=invoices, payments=payments,
         ic_entries=entries, ic_elimination=elimination, shared_costs=shared_costs,
@@ -834,3 +837,33 @@ def test_a_model_without_a_register_writes_an_empty_one(tmp_path: Path):
     bare = replace(baseline.model, exception_register={})
     written = write_decision_package(bare, tmp_path / "bare")
     assert json.loads(written["exception_register"].read_text(encoding="utf-8")) == {}
+
+
+def test_the_register_records_when_each_exception_was_raised(tmp_path: Path):
+    """The close run timestamp is the creation time of its own exceptions.
+
+    Left as None the register could not answer 'when was this raised?', which
+    is the first question asked of an investigation record. The value is the
+    same one already stamped on close_decision.json and audit_trail.json, so
+    nothing new is generated and a fixed --run-timestamp keeps it reproducible.
+    """
+    result = run_close(
+        config_for(tmp_path, fx_rates=_require(ERR / "fx_rates.csv"), dataset_label="E4")
+    )
+    register = _register_of(result.written)
+
+    assert register["exceptions"], "E4 must raise exceptions to timestamp"
+    for entry in register["exceptions"]:
+        created = entry["history"][0]
+        assert created["action"] == "CREATED"
+        assert created["occurred_at"] == FIXED_TIMESTAMP
+
+    # the same instant the rest of the package carries
+    decision = json.loads(result.written["close_decision"].read_text(encoding="utf-8"))
+    assert decision["run_timestamp"] == FIXED_TIMESTAMP
+
+
+def test_a_clean_register_has_no_events_to_timestamp(tmp_path: Path):
+    _require(RAW / "invoices.csv")
+    result = run_close(config_for(tmp_path))
+    assert _register_of(result.written)["exceptions"] == []

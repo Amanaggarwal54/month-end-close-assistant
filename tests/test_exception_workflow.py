@@ -673,3 +673,279 @@ def test_short_field_spellings_are_still_accepted():
     assert exception["name"] == "FX rate accuracy"
     assert exception["group"] == "FX"
     assert exception["family"] == "SOURCE_ACCURACY"
+
+
+# ---------------------------------------------------------------------------
+# Step 12C: the caller-supplied time dimension
+# ---------------------------------------------------------------------------
+CREATED_AT = "2026-03-31T18:00:00Z"
+OWNED_AT = "2026-03-31T18:05:00Z"
+STARTED_AT = "2026-03-31T18:10:00Z"
+RESOLVED_AT = "2026-03-31T18:30:00Z"
+
+
+def test_created_event_has_no_timestamp_unless_one_is_supplied():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    for exception in register["exceptions"]:
+        created = exception["history"][0]
+        assert created["action"] == "CREATED"
+        assert "occurred_at" in created, "the key must exist even when empty"
+        assert created["occurred_at"] is None
+
+
+def test_created_event_keeps_an_explicit_creation_timestamp():
+    register = build_exception_register(
+        sample_exceptions(), "E4", occurred_at=CREATED_AT
+    )
+
+    for exception in register["exceptions"]:
+        assert exception["history"][0]["occurred_at"] == CREATED_AT
+
+
+def test_owner_and_status_events_default_to_no_timestamp():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    register = assign_owner(register, "EXC-FXC-03-E4", "finance.manager")
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING, comment="Started."
+    )
+
+    exception = get_exception(register, "EXC-FXC-03-E4")
+    assert [item["occurred_at"] for item in exception["history"]] == [None, None, None]
+
+
+def test_assign_owner_stores_the_supplied_timestamp_verbatim():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    updated = assign_owner(
+        register,
+        "EXC-FXC-03-E4",
+        "finance.manager",
+        occurred_at=OWNED_AT,
+    )
+
+    event = get_exception(updated, "EXC-FXC-03-E4")["history"][-1]
+    assert event["action"] == "OWNER_CHANGED"
+    assert event["occurred_at"] == OWNED_AT
+
+
+def test_transition_stores_the_supplied_timestamp_verbatim():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    updated = transition_exception(
+        register,
+        "EXC-FXC-03-E4",
+        INVESTIGATING,
+        comment="Investigation started.",
+        occurred_at=STARTED_AT,
+    )
+
+    event = get_exception(updated, "EXC-FXC-03-E4")["history"][-1]
+    assert event["action"] == "STATUS_CHANGED"
+    assert event["occurred_at"] == STARTED_AT
+
+
+def test_a_timestamp_is_never_reformatted():
+    """Stored verbatim means verbatim: no parsing, padding or normalising."""
+    odd_but_caller_chosen = "31/03/2026 18:05  (Europe/Brussels)"
+
+    register = build_exception_register(sample_exceptions(), "E4")
+    updated = assign_owner(
+        register,
+        "EXC-FXC-03-E4",
+        "finance.manager",
+        occurred_at=odd_but_caller_chosen,
+    )
+
+    event = get_exception(updated, "EXC-FXC-03-E4")["history"][-1]
+    assert event["occurred_at"] == odd_but_caller_chosen
+
+
+def test_a_full_lifecycle_records_a_timestamp_on_every_event():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    register = assign_owner(
+        register, "EXC-FXC-03-E4", "finance.manager", occurred_at=OWNED_AT
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING,
+        comment="Reviewing the February FX source.", occurred_at=STARTED_AT,
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", RESOLVED,
+        comment="Confirmed the incorrect February rate.",
+        evidence=[{"type": "control_result", "reference": "FXC-03"}],
+        occurred_at=RESOLVED_AT,
+    )
+
+    exception = get_exception(register, "EXC-FXC-03-E4")
+
+    assert [
+        (item["action"], item["occurred_at"]) for item in exception["history"]
+    ] == [
+        ("CREATED", None),
+        ("OWNER_CHANGED", OWNED_AT),
+        ("STATUS_CHANGED", STARTED_AT),
+        ("STATUS_CHANGED", RESOLVED_AT),
+    ]
+
+
+def test_a_reopened_exception_records_when_it_was_reopened():
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING,
+        comment="Started.", occurred_at=STARTED_AT,
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", OPEN,
+        comment="Waiting for evidence.", occurred_at=RESOLVED_AT,
+    )
+
+    reopened = get_exception(register, "EXC-FXC-03-E4")["history"][-1]
+    assert reopened["from_status"] == INVESTIGATING
+    assert reopened["to_status"] == OPEN
+    assert reopened["occurred_at"] == RESOLVED_AT
+
+
+def test_resolution_does_not_duplicate_the_timestamp():
+    """The event log owns 'when'; resolution owns 'what' and 'on what evidence'.
+
+    Two copies of the same fact could disagree after an edit, and the history
+    event is the one a reviewer reads in sequence.
+    """
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING, comment="Started.",
+        occurred_at=STARTED_AT,
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", RESOLVED, comment="Explained.",
+        evidence=[{"type": "control_result", "reference": "FXC-03"}],
+        occurred_at=RESOLVED_AT,
+    )
+
+    exception = get_exception(register, "EXC-FXC-03-E4")
+    assert set(exception["resolution"]) == {"comment", "evidence"}
+    assert exception["history"][-1]["occurred_at"] == RESOLVED_AT
+
+
+def test_an_invalid_timestamp_is_rejected_at_the_call_that_introduced_it():
+    """A non-string would only fail later, when the register is serialised."""
+    register = build_exception_register(sample_exceptions(), "E4")
+
+    for bad in (20260331, "", "   ", ["2026-03-31"]):
+        with pytest.raises(ValueError, match="occurred_at"):
+            assign_owner(register, "EXC-FXC-03-E4", "finance.manager", occurred_at=bad)
+
+        with pytest.raises(ValueError, match="occurred_at"):
+            transition_exception(
+                register, "EXC-FXC-03-E4", INVESTIGATING,
+                comment="Started.", occurred_at=bad,
+            )
+
+    with pytest.raises(ValueError, match="occurred_at"):
+        build_exception_register(sample_exceptions(), "E4", occurred_at=123)
+
+
+def test_identical_timestamps_produce_identical_registers():
+    def build():
+        register = build_exception_register(
+            sample_exceptions(), "E4", occurred_at=CREATED_AT
+        )
+        register = assign_owner(
+            register, "EXC-FXC-03-E4", "finance.manager", occurred_at=OWNED_AT
+        )
+        register = transition_exception(
+            register, "EXC-FXC-03-E4", INVESTIGATING,
+            comment="Started.", occurred_at=STARTED_AT,
+        )
+        return transition_exception(
+            register, "EXC-FXC-03-E4", RESOLVED, comment="Explained.",
+            evidence=[{"type": "control_result", "reference": "FXC-03"}],
+            occurred_at=RESOLVED_AT,
+        )
+
+    assert build() == build()
+
+
+def test_different_timestamps_produce_different_registers():
+    """Determinism must not mean the timestamp is ignored."""
+    base = build_exception_register(sample_exceptions(), "E4")
+
+    first = assign_owner(base, "EXC-FXC-03-E4", "a.person", occurred_at=OWNED_AT)
+    second = assign_owner(base, "EXC-FXC-03-E4", "a.person", occurred_at=RESOLVED_AT)
+
+    assert first != second
+
+
+def test_timestamps_do_not_mutate_the_input_register():
+    register = build_exception_register(sample_exceptions(), "E4")
+    original = copy.deepcopy(register)
+
+    assign_owner(register, "EXC-FXC-03-E4", "finance.manager", occurred_at=OWNED_AT)
+    transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING, comment="Started.",
+        occurred_at=STARTED_AT,
+    )
+
+    assert register == original
+
+
+def test_the_module_never_reads_a_clock():
+    """Grep the production source: no clock call may exist anywhere in it."""
+    import ast
+
+    source_path = ROOT / "src" / "exception_workflow.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    assert "datetime" not in imported
+    assert "time" not in imported
+    assert "uuid" not in imported
+    assert "random" not in imported
+
+    for token in ("datetime", "time.time", "now(", "utcnow", "uuid", "random"):
+        assert token not in source, f"{token!r} must not appear in the workflow"
+
+
+def test_a_register_with_timestamps_survives_json_serialisation_unchanged():
+    """The register ships as exception_register.json, so this is what matters."""
+    import json
+
+    register = build_exception_register(
+        sample_exceptions(), "E4", occurred_at=CREATED_AT
+    )
+    register = assign_owner(
+        register, "EXC-FXC-03-E4", "finance.manager", occurred_at=OWNED_AT
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", INVESTIGATING, comment="Started.",
+        occurred_at=STARTED_AT,
+    )
+    register = transition_exception(
+        register, "EXC-FXC-03-E4", RESOLVED, comment="Explained.",
+        evidence=[{"type": "control_result", "reference": "FXC-03"}],
+        occurred_at=RESOLVED_AT,
+    )
+
+    encoded = json.dumps(register, indent=2, sort_keys=True)
+    restored = json.loads(encoded)
+
+    assert restored == register
+    assert [
+        item["occurred_at"]
+        for item in restored["exceptions"][0]["history"]
+    ] == [CREATED_AT, OWNED_AT, STARTED_AT, RESOLVED_AT]
+
+    # and the serialisation itself is stable
+    assert json.dumps(restored, indent=2, sort_keys=True) == encoded

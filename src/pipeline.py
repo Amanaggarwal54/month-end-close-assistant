@@ -226,8 +226,12 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
     # after the decision and is never read back into it: resolution state tracks
     # what a person did about a failure, it does not change whether the control
     # failed or whether the close may be reported.
+    # The run timestamp is this close's creation time and already stamps every
+    # other artefact, so it is passed explicitly as the CREATED time rather than
+    # left None: without it the register could not answer when an exception was
+    # raised. The workflow still generates nothing of its own.
     exception_register = build_exception_register(
-        exception_records, config.dataset_label
+        exception_records, config.dataset_label, occurred_at=timestamp
     )
 
     model = build_report_model(
