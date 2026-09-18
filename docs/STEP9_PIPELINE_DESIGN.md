@@ -401,3 +401,66 @@ injector refuses `data/raw`. Truth still runs one way only: `pipeline.py` and
 `report.py` contain no reference to the review workspace, and a test asserts it.
 A RESOLVED exception in a workspace records that somebody investigated a
 failure; the package still says FAIL, and its register still says OPEN.
+
+---
+
+## 15. Amendment (Step 12E): the reviewer command line
+
+`src/review_cli.py` is the front end a reviewer actually uses. It parses
+arguments, loads a workspace, applies exactly one operation, writes it back and
+prints something readable. It decides nothing.
+
+```
+review_cli.py        argument parsing, output, exit codes
+      |
+review_workspace.py  provenance, integrity, workspace persistence
+      |
+exception_workflow.py  ids, owners, statuses, transitions, history, validation
+```
+
+| Command | Responsibility |
+|---|---|
+| `create` | verify the close package through `create_resolution_workspace()`, then write the workspace |
+| `list` | one deterministic line per exception: id, status, owner, severity, control |
+| `show` | the complete record for one exception, as sorted-key JSON |
+| `assign` | set or clear the owner (`--owner` / `--clear-owner`) |
+| `transition` | move to a status, passing comment and evidence through unchanged |
+| `resolve` | transition to RESOLVED, requiring `--comment` and at least one `--evidence` |
+
+Evidence is given as `--evidence TYPE:REFERENCE` and is repeatable. Only the
+first colon separates the two fields, so a reference may itself contain colons -
+a path or a timestamp usually does.
+
+**Exit codes**
+
+| Code | Meaning |
+|---|---|
+| 0 | the command succeeded |
+| 1 | the input could not be used: missing workspace, unknown exception, bad argument |
+| 2 | the workflow refused the operation: invalid transition, missing comment or evidence |
+| 3 | the close package does not match its own manifest |
+| 4 | the command would have written inside the immutable close package |
+
+1 and 2 are deliberately different: 2 means the lifecycle rules did their job,
+1 means the command never got far enough to be judged.
+
+**No rules live here.** Statuses, allowed transitions, the terminal RESOLVED
+state and the comment-and-evidence a resolution requires are all enforced in
+`exception_workflow.py` and reach the CLI only through `review_workspace.py`. A
+test parses `review_cli.py` and asserts it redefines no status constant and no
+transition table, and that it imports neither pandas nor numpy.
+
+**No clock.** Every mutating command requires `--occurred-at` and stores it
+verbatim; a test passes a deliberately non-ISO string and asserts it survives
+character-for-character.
+
+**`create` refuses to overwrite an existing workspace** unless `--force` is
+given. Re-creating rebuilds every entry from the close package, so a second run
+would silently discard an investigation already recorded in the workspace.
+
+**Known wart.** `review_workspace.py` imports `sha256_of`, `slugify` and
+`display_path` from `report.py` - the deliberate reuse of one hashing
+convention - which means a reviewer running `review_cli list` transitively loads
+pandas, numpy, reportlab and PIL to print five lines of text. Lifting those three
+helpers into a small `src/paths.py` would fix it, at the cost of editing
+`report.py`.
