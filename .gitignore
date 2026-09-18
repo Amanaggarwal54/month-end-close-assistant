@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+
+data/raw/close_decision.json
+data/raw/control_results.csv
