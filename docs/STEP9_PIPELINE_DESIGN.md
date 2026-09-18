@@ -458,9 +458,47 @@ character-for-character.
 given. Re-creating rebuilds every entry from the close package, so a second run
 would silently discard an investigation already recorded in the workspace.
 
-**Known wart.** `review_workspace.py` imports `sha256_of`, `slugify` and
-`display_path` from `report.py` - the deliberate reuse of one hashing
-convention - which means a reviewer running `review_cli list` transitively loads
-pandas, numpy, reportlab and PIL to print five lines of text. Lifting those three
-helpers into a small `src/paths.py` would fix it, at the cost of editing
-`report.py`.
+**Dependency note.** The three generic helpers `sha256_of`, `slugify` and
+`display_path` live in `src/paths.py` (see §16), so the reviewer tool shares one
+hashing convention with the close package without inheriting the reporting
+stack.
+
+---
+
+## 16. Amendment (Step 12F): generic helpers moved out of report.py
+
+`sha256_of`, `slugify` and `display_path` are needed by the close package and by
+the reviewer tool, and belong to neither. They were defined in `report.py`, so
+`review_workspace.py` imported the reporting module to reach them and a reviewer
+running `review_cli list` loaded pandas, numpy, reportlab and PIL to print five
+lines of text.
+
+They now live in `src/paths.py`: standard library only, no project imports.
+
+```
+paths.py              hashlib, re, pathlib - nothing else
+   |         \
+report.py     review_workspace.py -> review_cli.py
+   |
+pandas, numpy, reportlab   (only where they are genuinely needed)
+```
+
+There is exactly one implementation of each helper. `report.py` re-exports all
+three, so `from report import sha256_of` keeps working for every existing
+caller, and a test asserts `report.sha256_of is paths.sha256_of` - the same
+object, so the two sides cannot drift.
+
+Measured in fresh interpreters:
+
+| import | modules loaded | pandas / numpy / reportlab |
+|---|---|---|
+| `paths` | 57 | none |
+| `review_workspace` | 67 | none |
+| `review_cli` | 70 | none |
+| `report` | 176 | all, as it should |
+
+The dependency tests run in a subprocess rather than checking this process's
+`sys.modules`, because the test session has already imported pandas for its own
+reasons and an in-process check would pass regardless of what the production
+imports do. A positive control asserts `report` still loads the stack, so the
+negative tests cannot pass by measuring nothing.

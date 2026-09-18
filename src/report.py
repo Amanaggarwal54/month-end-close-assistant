@@ -22,7 +22,6 @@ Layers
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -55,6 +54,7 @@ from reportlab.platypus import (  # noqa: E402
     TableStyle,
 )
 
+from paths import display_path, sha256_of, slugify  # noqa: E402,F401
 from plant_downstream_errors import ProtectedPathError, assert_writable  # noqa: E402,F401
 
 REPORT_VERSION = "1.0.0"
@@ -130,12 +130,6 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def slugify(label: str) -> str:
-    """Lowercase, non-alphanumerics to '-', so a label can never escape its directory."""
-    slug = re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")
-    return slug or "unlabelled"
-
-
 def _month_key(value: Any) -> str | None:
     text = _text(value).strip()
     if not text:
@@ -144,14 +138,6 @@ def _month_key(value: Any) -> str | None:
         return pd.Period(pd.to_datetime(text), freq="M").strftime("%Y-%m")
     except Exception:  # noqa: BLE001
         return None
-
-
-def sha256_of(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -909,21 +895,6 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     _write_json(manifest_path, manifest)
     outputs["package_manifest"] = manifest_path
     return outputs
-
-
-def display_path(path: str | Path) -> str:
-    """Path as shown in the provenance appendix.
-
-    Rendered relative to the working directory when the file sits under it, so
-    two callers that name the same file differently (one absolute, one relative)
-    produce identical documents - and so a committed example report does not
-    carry the author's home directory.
-    """
-    candidate = Path(path)
-    try:
-        return Path(candidate).resolve().relative_to(Path.cwd().resolve()).as_posix()
-    except ValueError:
-        return candidate.resolve().as_posix()
 
 
 def describe_inputs(paths: dict[str, str | Path]) -> list[dict]:

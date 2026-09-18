@@ -41,7 +41,7 @@ from exception_workflow import (
     transition_exception,
     validate_register,
 )
-from report import display_path, sha256_of, slugify
+from paths import display_path, sha256_of, slugify
 
 __all__ = [
     "WORKSPACE_VERSION",
