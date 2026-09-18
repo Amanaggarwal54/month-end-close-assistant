@@ -61,7 +61,14 @@ def generate_data(with_errors: bool = False, seed: int = 20260917) -> dict[str, 
     invoice_rows = []
     for idx, po in pos.iterrows():
         meta = ENTITIES[po.entity]
-        invoice_date = pd.to_datetime(po.po_date) + pd.Timedelta(days=int(rng.integers(1, 12)))
+        po_date = pd.to_datetime(po.po_date)
+        # Same draw as before: the RNG stream is untouched, so every downstream
+        # value (amounts, suppliers, shares) is identical to earlier runs.
+        offset = int(rng.integers(1, 12))
+        # An invoice belongs to the accounting month of its PO, so a late-month
+        # PO cannot push its invoice into the next period. The offset is clamped
+        # after it is drawn, never redrawn or bounded inside the draw.
+        invoice_date = min(po_date + pd.Timedelta(days=offset), po_date + pd.offsets.MonthEnd(0))
         net = _money(po.net_amount)
         vat = _money(net * meta["vat_rate"])
         total = _money(net + vat)
