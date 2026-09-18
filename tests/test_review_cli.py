@@ -664,5 +664,5 @@ def test_every_documented_command_is_wired_up():
     ]
     assert actions, "the CLI must expose subcommands"
     assert set(actions[0].choices) == {
-        "create", "list", "show", "assign", "transition", "resolve"
+        "create", "list", "show", "assign", "transition", "resolve", "investigate"
     }

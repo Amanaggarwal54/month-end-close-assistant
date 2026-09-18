@@ -35,6 +35,7 @@ Exit codes
     2  the workflow refused the operation (invalid transition, missing comment or evidence)
     3  the close package does not match its own manifest
     4  the command would have written inside the immutable close package
+    5  the advisory investigation provider or store failed
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from typing import Any, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from exception_workflow import INVESTIGATING, OPEN, RESOLVED  # noqa: E402
+from investigation import InvestigationError  # noqa: E402
 from review_workspace import (  # noqa: E402
     WORKSPACE_FILENAME,
     PackageIntegrityError,
@@ -60,6 +62,10 @@ from review_workspace import (  # noqa: E402
     workspace_path_for,
     write_workspace,
 )
+from investigation_review import (  # noqa: E402
+    InvestigationStoreError,
+    run_claude_investigation,
+)
 
 __all__ = [
     "EXIT_OK",
@@ -67,6 +73,7 @@ __all__ = [
     "EXIT_LIFECYCLE",
     "EXIT_INTEGRITY",
     "EXIT_PROTECTED",
+    "EXIT_INVESTIGATION",
     "build_parser",
     "main",
 ]
@@ -76,6 +83,7 @@ EXIT_USAGE = 1
 EXIT_LIFECYCLE = 2
 EXIT_INTEGRITY = 3
 EXIT_PROTECTED = 4
+EXIT_INVESTIGATION = 5
 
 #: Statuses a reviewer may name on the command line. RESOLVED is reachable
 #: through `transition` too, but `resolve` is the command that asks for the
@@ -191,6 +199,35 @@ def build_parser() -> argparse.ArgumentParser:
                          required=True, metavar="TYPE:REFERENCE",
                          help="repeatable; at least one reference is required")
     _add_occurred_at(resolve)
+
+    investigate = commands.add_parser(
+        "investigate",
+        help="ask Claude for advisory analysis of one exception and store it in the review workspace",
+    )
+    _add_workspace_arguments(investigate)
+    _add_exception_argument(investigate)
+    investigate.add_argument(
+        "--occurred-at", required=True,
+        help="when the investigation was run, supplied by the caller; nothing here reads a clock",
+    )
+    investigate.add_argument(
+        "--model",
+        help="Claude model id; defaults to ANTHROPIC_MODEL or the provider default",
+    )
+    investigate.add_argument(
+        "--max-tokens", type=int, default=2048,
+        help="maximum response tokens (default: 2048)",
+    )
+    investigate.add_argument(
+        "--structured-output-mode",
+        choices=("auto", "output_config", "output_format", "tool", "prompt"),
+        default="auto",
+        help="Claude structured-output mode (default: auto)",
+    )
+    investigate.add_argument(
+        "--source-file", action="append", default=[],
+        help="optional source-file reference exposed to the investigation; repeatable",
+    )
 
     return parser
 
@@ -361,6 +398,27 @@ def _command_resolve(args: argparse.Namespace, out) -> int:
     )
 
 
+def _command_investigate(args: argparse.Namespace, out) -> int:
+    workspace = load_workspace(args.review_dir, args.dataset_label)
+    workspace_path = workspace_path_for(args.review_dir, args.dataset_label)
+
+    record, written = run_claude_investigation(
+        workspace,
+        args.exception_id,
+        review_dir=args.review_dir,
+        workspace_path=workspace_path,
+        occurred_at=args.occurred_at,
+        source_files=args.source_file,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        structured_output_mode=args.structured_output_mode,
+    )
+
+    print(json.dumps(record, indent=2, sort_keys=True), file=out)
+    print(f"Stored {written}", file=out)
+    return EXIT_OK
+
+
 _COMMANDS = {
     "create": _command_create,
     "list": _command_list,
@@ -368,6 +426,7 @@ _COMMANDS = {
     "assign": _command_assign,
     "transition": _command_transition,
     "resolve": _command_resolve,
+    "investigate": _command_investigate,
 }
 
 
@@ -404,6 +463,12 @@ def main(argv: Sequence[str] | None = None, out=None) -> int:
     except TypeError as error:
         print(f"Rejected: {error}", file=stream)
         return EXIT_USAGE
+    except InvestigationError as error:
+        print(f"Investigation failed: {error}", file=stream)
+        return EXIT_INVESTIGATION
+    except InvestigationStoreError as error:
+        print(f"Investigation failed: {error}", file=stream)
+        return EXIT_INVESTIGATION
 
 
 if __name__ == "__main__":
