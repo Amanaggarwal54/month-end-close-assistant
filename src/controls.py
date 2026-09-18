@@ -18,9 +18,14 @@ RECONCILIATION  do the artefacts agree with each other?
 COMPLETENESS    is everything that should be present actually present?
 SOURCE_ACCURACY do the inputs agree with a reference outside the system?
 
-Phase 1 implements the MAT, ICO, SRC and CVG groups. The FXC group
-(source accuracy for FX, including E4 detection) arrives in Phase 2, so no
-control in this file can detect a rate that is internally consistent but wrong.
+Groups: MAT (matching), ICO (intercompany structure), SRC (shared-cost source),
+CVG (coverage) and FXC (FX source accuracy and re-performance).
+
+The FXC group exists because the others cannot catch a wrong FX rate: when both
+sides of a recharge use the same wrong rate, every reconciliation control passes
+and the books are internally perfect and externally wrong. FXC-03 tests the rate
+file against a reference; FXC-05 re-performs the recharge arithmetic at
+reference rates and tests the entries that were actually booked.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import pandas as pd
 
-CONTROLS_VERSION = "phase1-1.0.0"
+CONTROLS_VERSION = "2.0.0"
 
 # result statuses
 PASS = "PASS"
@@ -47,6 +52,8 @@ SEV_WARNING = "WARNING"
 RECONCILIATION = "RECONCILIATION"
 COMPLETENESS = "COMPLETENESS"
 SOURCE_ACCURACY = "SOURCE_ACCURACY"
+
+BASE_CURRENCY = "EUR"
 
 # close statuses
 CLOSE_PASS = "PASS"
@@ -147,6 +154,17 @@ def _month_key(value: Any) -> str | None:
 
 def _numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
+
+
+def _to_number(value: Any) -> float | None:
+    """Parse a scalar to float; None for blanks and unparseable values."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(result) else result
 
 
 def _samples(values: Iterable[Any], limit: int) -> str:
@@ -866,6 +884,232 @@ def _cvg_controls(
     return results
 
 
+
+# ---------------------------------------------------------------------------
+# FXC - independent FX controls (source accuracy)
+# ---------------------------------------------------------------------------
+def _fx_table(fx_rates: pd.DataFrame) -> pd.DataFrame:
+    """Normalise an FX table to month key + rate, without collapsing duplicates.
+
+    Duplicates are deliberately preserved: building a lookup dictionary would
+    silently keep one of them, and FXC-02 exists to catch exactly that.
+    """
+    table = fx_rates.copy()
+    table["month_key"] = table["month_end"].map(_month_key)
+    table["rate"] = _numeric(table["eur_usd"])
+    return table[["month_key", "rate"]]
+
+
+def _fx_lookup(table: pd.DataFrame) -> dict[str, float]:
+    """month key -> rate, keeping the first occurrence (duplicates are a control finding)."""
+    lookup: dict[str, float] = {}
+    for row in table.itertuples():
+        if row.month_key and not pd.isna(row.rate) and row.month_key not in lookup:
+            lookup[row.month_key] = float(row.rate)
+    return lookup
+
+
+def _reperform_entry(row: pd.Series, rate: float | None, config: ControlConfig) -> dict | None:
+    """Recompute one entry from its own source fields at the reference rate.
+
+    Deliberately independent of intercompany.py: nothing is imported from it, the
+    entry's own fx_rate_eur_usd column is ignored (that rate is what is under
+    test), and the arithmetic is plain float compared within the 0.01 amount
+    tolerance rather than reusing the generator's rounding helper.
+
+    Returns None when the entry re-performs correctly.
+    """
+    source_amount = _to_number(row.get("source_amount"))
+    share = _to_number(row.get("share_pct"))
+    markup = _to_number(row.get("markup_pct"))
+    booked_eur = _to_number(row.get("eur_equivalent"))
+    booked_local = _to_number(row.get("local_amount"))
+    source_currency = str(row.get("source_currency") or "").strip()
+    local_currency = str(row.get("currency") or "").strip()
+
+    if None in (source_amount, share, markup, booked_eur, booked_local):
+        # Incomplete entries are ICO-03's finding, not a re-performance failure.
+        return None
+
+    expected_source = source_amount * share * (1.0 + markup)
+
+    if source_currency == BASE_CURRENCY:
+        expected_eur = expected_source
+    elif rate:
+        expected_eur = expected_source / rate
+    else:
+        return {"reason": "no reference rate for this month", "difference": None}
+
+    if local_currency == BASE_CURRENCY:
+        expected_local = expected_eur
+    elif rate:
+        expected_local = expected_eur * rate
+    else:
+        return {"reason": "no reference rate for this month", "difference": None}
+
+    eur_difference = booked_eur - expected_eur
+    local_difference = booked_local - expected_local
+    tolerance = config.amount_tolerance
+
+    if abs(eur_difference) > tolerance:
+        return {
+            "reason": f"EUR equivalent booked {booked_eur:,.2f}, reference {expected_eur:,.2f}",
+            "difference": round(eur_difference, 2),
+        }
+    if abs(local_difference) > tolerance:
+        return {
+            "reason": f"local amount booked {booked_local:,.2f}, reference {expected_local:,.2f}",
+            "difference": round(local_difference, 2),
+        }
+    return None
+
+
+def _fxc_controls(
+    fx_actual: pd.DataFrame,
+    fx_reference: pd.DataFrame,
+    ic_entries: pd.DataFrame,
+    config: ControlConfig,
+) -> list[dict]:
+    results: list[dict] = []
+    actual = _fx_table(fx_actual)
+    reference = _fx_table(fx_reference)
+    actual_lookup = _fx_lookup(actual)
+    reference_lookup = _fx_lookup(reference)
+
+    accounting = ic_entries[ic_entries["entry_type"].isin(["RECEIVABLE", "PAYABLE"])]
+    entry_months = {m for m in accounting["month"].map(_month_key) if m}
+    required_months = sorted(entry_months | set(reference_lookup))
+
+    # FXC-01 coverage ---------------------------------------------------------
+    uncovered = sorted(m for m in required_months if m not in actual_lookup)
+    results.append(
+        _count_control(
+            "FXC-01", "FX coverage", "FXC", COMPLETENESS,
+            "Every month that needs a rate has exactly one usable rate in the FX file.",
+            CRITICAL, uncovered, uncovered, config,
+            "A rate is available for every month in scope.",
+            "{count} month(s) needing a rate have none in the FX file.",
+        )
+    )
+
+    # FXC-02 duplicate months -------------------------------------------------
+    counts = actual["month_key"].value_counts()
+    duplicates = sorted(counts[counts > 1].index)
+    results.append(
+        _count_control(
+            "FXC-02", "No duplicate FX months", "FXC", COMPLETENESS,
+            "No month appears twice in the FX file; a duplicate makes the rate ambiguous "
+            "and a lookup would silently keep one of them.",
+            CRITICAL, duplicates, duplicates, config,
+            "Each month appears exactly once.",
+            "{count} month(s) appear more than once in the FX file.",
+        )
+    )
+
+    # FXC-03 rate matches reference -------------------------------------------
+    mismatches: list[tuple[str, float, float, float]] = []
+    for month in sorted(set(actual_lookup) & set(reference_lookup)):
+        difference = actual_lookup[month] - reference_lookup[month]
+        if abs(difference) > config.fx_comparison_tolerance:
+            mismatches.append((month, reference_lookup[month], actual_lookup[month], difference))
+
+    worst = max(mismatches, key=lambda m: abs(m[3])) if mismatches else None
+    results.append(
+        _result(
+            "FXC-03",
+            "FX rate matches reference",
+            "FXC",
+            SOURCE_ACCURACY,
+            "Each supplied rate equals the reference rate for that month. Elimination "
+            "cannot detect a wrong rate, because both sides use it.",
+            CRITICAL,
+            _verdict(CRITICAL, bool(mismatches)),
+            expected_value=None if not worst else worst[1],
+            actual_value=None if not worst else worst[2],
+            difference=None if not worst else round(worst[3], 6),
+            month=None if not worst else worst[0],
+            failed_count=len(mismatches),
+            sample_refs=_samples([m[0] for m in mismatches], config.max_sample_refs),
+            error_reference="E4",
+            explanation=(
+                "Every supplied rate matches the reference."
+                if not mismatches
+                else f"{len(mismatches)} month(s) differ from the reference; largest gap "
+                f"{worst[3]:+.4f} in {worst[0]} (reference {worst[1]}, supplied {worst[2]})."
+            ),
+        )
+    )
+
+    # FXC-04 unexpected months ------------------------------------------------
+    unexpected = sorted(set(actual_lookup) - set(reference_lookup))
+    results.append(
+        _count_control(
+            "FXC-04", "No unexpected FX months", "FXC", SOURCE_ACCURACY,
+            "Months present in the FX file but absent from the reference are reported.",
+            SEV_WARNING, unexpected, unexpected, config,
+            "The FX file carries no months the reference does not.",
+            "{count} month(s) in the FX file are not in the reference.",
+        )
+    )
+
+    # FXC-05 re-performance ---------------------------------------------------
+    failures: list[dict] = []
+    for _, row in accounting[accounting["status"] == "VALID"].iterrows():
+        month = _month_key(row.get("month"))
+        outcome = _reperform_entry(row, reference_lookup.get(month), config)
+        if outcome:
+            failures.append({"entry_id": row.get("entry_id"), **outcome})
+
+    largest = None
+    for failure in failures:
+        value = failure.get("difference")
+        if value is not None and (largest is None or abs(value) > abs(largest)):
+            largest = value
+    results.append(
+        _result(
+            "FXC-05",
+            "Recharge re-performance at reference rates",
+            "FXC",
+            SOURCE_ACCURACY,
+            "Every booked entry is recomputed from its own source amount, share and markup "
+            "at the reference rate, and both the EUR equivalent and the local amount must "
+            "agree. Independent of intercompany.py and of the rate recorded on the entry.",
+            CRITICAL,
+            _verdict(CRITICAL, bool(failures)),
+            expected_value=0,
+            actual_value=len(failures),
+            difference=largest,
+            failed_count=len(failures),
+            sample_refs=_samples([f["entry_id"] for f in failures], config.max_sample_refs),
+            error_reference="E4",
+            explanation=(
+                "Every entry re-performs to the reference within tolerance."
+                if not failures
+                else f"{len(failures)} entr(y/ies) do not re-perform at reference rates; "
+                f"first: {failures[0]['entry_id']} - {failures[0]['reason']}."
+            ),
+        )
+    )
+
+    # FXC-06 plausibility -----------------------------------------------------
+    implausible = [
+        (row.month_key, row.rate)
+        for row in actual.itertuples()
+        if pd.isna(row.rate) or not (config.fx_min <= float(row.rate) <= config.fx_max)
+    ]
+    results.append(
+        _count_control(
+            "FXC-06", "FX rate plausibility", "FXC", SOURCE_ACCURACY,
+            f"Every rate is positive and inside the configured band "
+            f"{config.fx_min}-{config.fx_max} (project assumption, not a specification rule).",
+            CRITICAL, implausible, [m for m, _ in implausible], config,
+            "Every rate is inside the plausible band.",
+            "{count} rate(s) fall outside the plausible band or are missing.",
+        )
+    )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
@@ -879,12 +1123,17 @@ def run_controls(
     ic_entries: pd.DataFrame,
     ic_elimination: pd.DataFrame,
     shared_costs: pd.DataFrame,
+    fx_actual: pd.DataFrame,
+    fx_reference: pd.DataFrame,
     purchase_orders: pd.DataFrame | None = None,
     config: ControlConfig | None = None,
     dataset_label: str = "",
     run_timestamp: str | None = None,
 ) -> pd.DataFrame:
     """Evaluate every Phase 1 control and return the results table.
+
+    ``fx_actual`` and ``fx_reference`` are required rather than optional: a
+    missing reference must never be mistaken for a passing FX check.
 
     Pure: reads nothing, writes nothing, mutates nothing. A control that cannot
     be executed returns status ERROR rather than being skipped, so a broken
@@ -898,6 +1147,7 @@ def run_controls(
         ("ICO", lambda: _ico_controls(ic_entries, ic_elimination, config)),
         ("SRC", lambda: _src_controls(ic_entries, shared_costs, config)),
         ("CVG", lambda: _cvg_controls(invoices, payments, shared_costs, ic_entries, config)),
+        ("FXC", lambda: _fxc_controls(fx_actual, fx_reference, ic_entries, config)),
     ]
 
     rows: list[dict] = []
@@ -1004,7 +1254,10 @@ if __name__ == "__main__":
     parser.add_argument("--invoices", default=None)
     parser.add_argument("--payments", default=None)
     parser.add_argument("--shared-costs", default=None)
-    parser.add_argument("--fx-rates", default=None)
+    parser.add_argument("--fx-rates", default=None,
+                        help="the FX file under test (data/error_data/fx_rates.csv for E4)")
+    parser.add_argument("--fx-reference", default=None,
+                        help="reference FX file, default data/raw/fx_rates_expected.csv")
     parser.add_argument("--ic-entries", default=None,
                         help="pre-generated intercompany entries CSV (used for E5/E6 testing)")
     parser.add_argument("--dataset-label", default=None)
@@ -1019,6 +1272,7 @@ if __name__ == "__main__":
     payments_df = read(args.payments or base / "payments.csv")
     costs_df = read(args.shared_costs or base / "shared_costs.csv")
     fx_df = read(args.fx_rates or base / "fx_rates.csv")
+    fx_reference_df = read(args.fx_reference or Path("data/raw/fx_rates_expected.csv"))
 
     match_df = three_way_match(pos_df, invoices_df, payments_df)
     if args.ic_entries:
@@ -1035,6 +1289,8 @@ if __name__ == "__main__":
         ic_entries=entries_df,
         ic_elimination=elimination_df,
         shared_costs=costs_df,
+        fx_actual=fx_df,
+        fx_reference=fx_reference_df,
         purchase_orders=pos_df,
         dataset_label=label,
     )

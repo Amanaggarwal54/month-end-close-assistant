@@ -49,6 +49,8 @@ def _controls_for(entries: pd.DataFrame, label: str):
     invoices = _read(RAW / "invoices.csv")
     payments = _read(RAW / "payments.csv")
     shared_costs = _read(RAW / "shared_costs.csv")
+    fx_rates = _read(RAW / "fx_rates.csv")
+    fx_reference = _read(RAW / "fx_rates_expected.csv")
 
     results = run_controls(
         match_results=three_way_match(pos, invoices, payments),
@@ -57,6 +59,8 @@ def _controls_for(entries: pd.DataFrame, label: str):
         ic_entries=entries,
         ic_elimination=check_elimination(entries),
         shared_costs=shared_costs,
+        fx_actual=fx_rates,
+        fx_reference=fx_reference,
         config=ControlConfig(),
         dataset_label=label,
     )

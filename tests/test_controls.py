@@ -49,6 +49,7 @@ def run_pipeline(
     po_path: Path = RAW / "purchase_orders.csv",
     shared_costs_path: Path = RAW / "shared_costs.csv",
     fx_path: Path = RAW / "fx_rates.csv",
+    fx_reference_path: Path = RAW / "fx_rates_expected.csv",
     ic_entries: pd.DataFrame | None = None,
     label: str = "test",
 ) -> tuple[pd.DataFrame, dict]:
@@ -58,6 +59,7 @@ def run_pipeline(
     payments = _read(payments_path)
     shared_costs = _read(shared_costs_path)
     fx_rates = _read(fx_path)
+    fx_reference = _read(fx_reference_path)
 
     match_results = three_way_match(pos, invoices, payments)
     entries = (
@@ -74,6 +76,8 @@ def run_pipeline(
         ic_entries=entries,
         ic_elimination=elimination,
         shared_costs=shared_costs,
+        fx_actual=fx_rates,
+        fx_reference=fx_reference,
         purchase_orders=pos,
         dataset_label=label,
     )
@@ -120,6 +124,7 @@ def test_run_controls_does_not_mutate_its_inputs():
     payments = _read(RAW / "payments.csv")
     shared_costs = _read(RAW / "shared_costs.csv")
     fx_rates = _read(RAW / "fx_rates.csv")
+    fx_reference = _read(RAW / "fx_rates_expected.csv")
 
     match_results = three_way_match(pos, invoices, payments)
     entries = generate_intercompany_entries(shared_costs, fx_rates)
@@ -139,6 +144,8 @@ def test_run_controls_does_not_mutate_its_inputs():
         ic_entries=entries,
         ic_elimination=elimination,
         shared_costs=shared_costs,
+        fx_actual=fx_rates,
+        fx_reference=fx_reference,
     )
 
     pd.testing.assert_frame_equal(invoices, before["invoices"])
@@ -251,7 +258,10 @@ def tiny_sources() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return pos, invoices, payments
 
 
-def _run_tiny(tiny_sources, entries, costs, config=None):
+TINY_FX = pd.DataFrame([{"month_end": "2026-01-31", "eur_usd": "1.08"}])
+
+
+def _run_tiny(tiny_sources, entries, costs, config=None, fx=None, fx_reference=None):
     pos, invoices, payments = tiny_sources
     match_results = three_way_match(pos, invoices, payments)
     elimination = check_elimination(entries)
@@ -263,6 +273,8 @@ def _run_tiny(tiny_sources, entries, costs, config=None):
         ic_entries=entries,
         ic_elimination=elimination,
         shared_costs=costs,
+        fx_actual=fx if fx is not None else TINY_FX,
+        fx_reference=fx_reference if fx_reference is not None else TINY_FX,
         config=config,
     )
     return results, decide_close(results, config=config)
@@ -394,6 +406,8 @@ def test_a_control_group_that_raises_becomes_an_error_row(tiny_sources, tiny_cos
         ic_entries=broken_entries,
         ic_elimination=pd.DataFrame(),
         shared_costs=tiny_costs,
+        fx_actual=TINY_FX,
+        fx_reference=TINY_FX,
         config=ControlConfig(period_months=("2026-01",)),
     )
     assert ERROR in set(results["status"])
