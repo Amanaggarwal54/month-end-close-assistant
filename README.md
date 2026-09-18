@@ -304,6 +304,17 @@ dataset under test would not be independent of it.
 2 and 1 are deliberately different: 2 means the controls did their job, 1 means
 the run never got far enough to have an opinion.
 
+### Audit trail and exceptions
+
+Every close run also produces two machine-readable audit artifacts:
+
+- `audit_trail.json` — close status, report eligibility, control counts, blocking controls, and the structured exceptions for the run.
+- `exceptions.json` — the exception records as a flat list for downstream review or further automation.
+
+Both are built by `src/audit.py`, which is a pure transformation layer over the deterministic control results. `src/report.py` only serializes the completed objects; it does not re-derive exceptions or close outcomes.
+
+`package_manifest.json` records SHA-256 hashes for both files as part of the decision package.
+
 ## Example output
 
 ```
