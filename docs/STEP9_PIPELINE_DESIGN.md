@@ -361,3 +361,43 @@ imports of `audit`, `controls`, `match`, `intercompany`, `report` or `pipeline`,
 and no generated timestamps. The pipeline calls it; `report.py` only serialises
 what it is handed, and a test asserts `report.py` neither imports the module nor
 calls the builder.
+
+---
+
+## 14. Amendment (Step 12D): the review workspace lives outside the package
+
+The close package is evidence of the close at the moment it was run, and it is
+finished the moment it is written. Investigation happens in a separate tree:
+
+```
+out/<dataset_label>/                          immutable close package (7 files)
+└── exception_register.json                   close-time snapshot, always OPEN
+
+review/<dataset_label>/
+└── exception_resolution.json                 mutable investigation record
+```
+
+`src/review_workspace.py` owns the file I/O that `exception_workflow.py` must
+never acquire: package provenance, integrity verification, workspace creation
+and persistence. It owns no lifecycle rules - statuses, transitions, resolution
+requirements and history stay in `exception_workflow.py`, which it calls. A test
+parses the module and asserts it neither redefines a status constant nor a
+transition table.
+
+`create_resolution_workspace(package_dir, review_dir)` re-hashes **every**
+artefact the manifest records, not only the register, and refuses a package that
+disagrees with its own manifest. The workspace then records
+`exception_register_sha256` and `package_manifest_sha256`, so it can always be
+traced to the package it came from.
+
+**The one thing integrity cannot cover:** a manifest cannot contain a stable
+hash of itself, so metadata edited inside the manifest - a `close_status`, say -
+is undetectable from within the package. Any recorded hash that is altered is
+caught, because it stops matching its file. Closing the remaining gap needs a
+signature or a record held outside the package.
+
+Writing refuses any path inside the close package, the same way the error
+injector refuses `data/raw`. Truth still runs one way only: `pipeline.py` and
+`report.py` contain no reference to the review workspace, and a test asserts it.
+A RESOLVED exception in a workspace records that somebody investigated a
+failure; the package still says FAIL, and its register still says OPEN.
