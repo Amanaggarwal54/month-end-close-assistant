@@ -4,6 +4,31 @@
 
 A synthetic finance automation project for a three-entity month-end close. The system combines deterministic accounting logic, independent close controls, audit-ready reporting, an immutable close package, a reviewer workflow, and an optional AI investigation layer.
 
+## 🚀 Run the Demo
+
+Run the complete deterministic demonstration without an API key:
+
+```powershell
+python .\scripts\demo.py
+```
+
+For the optional Gemini investigation:
+
+```powershell
+python .\scripts\demo.py --with-ai
+```
+
+Expected flow:
+
+```text
+Clean close          → PASS
+E4 FX error          → FAIL / BLOCKED
+Review workspace     → created
+Gemini investigation → advisory
+```
+
+See [`docs/RECRUITER_DEMO.md`](docs/RECRUITER_DEMO.md) for the full walkthrough.
+
 > **Core principle:** the LLM can investigate an exception, but it never makes the accounting decision. Matching, FX calculations, controls, close status, report eligibility, and exception lifecycle remain deterministic and human-controlled.
 
 ## What this project does
