@@ -21,6 +21,7 @@ from investigation_review import (  # noqa: E402
     investigation_path_for,
     load_investigation_store,
     run_claude_investigation,
+    run_gemini_investigation,
     run_investigation,
 )
 from paths import sha256_of  # noqa: E402
@@ -152,6 +153,47 @@ def make_fixture(tmp_path: Path):
     write_workspace(workspace, review)
     assert workspace_path.exists()
     return package, review, workspace_path, workspace
+
+
+def test_run_gemini_investigation_uses_gemini_provider_and_stores_advice(monkeypatch, tmp_path: Path):
+    package, review, workspace_path, workspace = make_fixture(tmp_path)
+    captured = {}
+
+    class FakeGeminiProvider:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def investigate(self, packet):
+            captured["packet"] = json.loads(json.dumps(packet))
+            return {
+                "exception_id": packet["exception_id"],
+                "summary": "Gemini found the February FX rate differs from the reference.",
+                "observations": ["The supplied rate is 1.19 while the reference is 1.09."],
+                "possible_causes": ["An incorrect FX source may have been used."],
+                "recommended_checks": ["Verify the approved February month-end FX source."],
+                "evidence_references": [{"type": "control_result", "reference": "FXC-03"}],
+                "uncertainties": ["The approved external FX feed was not supplied."],
+                "resolution_suggestion": "A human reviewer should verify the source and document the outcome.",
+                "provider": "google-gemini",
+                "model": "gemini-3.6-flash",
+                "machine_generated": True,
+            }
+
+    fake_module = types.SimpleNamespace(GeminiInvestigationProvider=FakeGeminiProvider)
+    monkeypatch.setitem(sys.modules, "gemini_provider", fake_module)
+
+    record, written = run_gemini_investigation(
+        workspace, FX_ID,
+        review_dir=review, workspace_path=workspace_path,
+        occurred_at=TIMESTAMP, source_files=["data/raw/fx_rates_expected.csv"],
+        model="gemini-3.6-flash", max_tokens=512,
+    )
+
+    assert captured["init"] == {"model": "gemini-3.6-flash", "max_tokens": 512}
+    assert captured["packet"]["exception_id"] == FX_ID
+    assert record["advisory"]["provider"] == "google-gemini"
+    assert record["advisory"]["machine_generated"] is True
+    assert written.exists()
 
 
 def test_run_investigation_stores_validated_advice_and_keeps_package_unchanged(tmp_path: Path):

@@ -65,6 +65,7 @@ from review_workspace import (  # noqa: E402
 from investigation_review import (  # noqa: E402
     InvestigationStoreError,
     run_claude_investigation,
+    run_gemini_investigation,
 )
 
 __all__ = [
@@ -202,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     investigate = commands.add_parser(
         "investigate",
-        help="ask Claude for advisory analysis of one exception and store it in the review workspace",
+        help="ask an AI provider for advisory analysis of one exception and store it in the review workspace",
     )
     _add_workspace_arguments(investigate)
     _add_exception_argument(investigate)
@@ -211,8 +212,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="when the investigation was run, supplied by the caller; nothing here reads a clock",
     )
     investigate.add_argument(
+        "--provider",
+        choices=("gemini", "claude"),
+        default="gemini",
+        help="AI provider (default: gemini)",
+    )
+    investigate.add_argument(
         "--model",
-        help="Claude model id; defaults to ANTHROPIC_MODEL or the provider default",
+        help="model id; defaults to the provider's environment setting or default",
     )
     investigate.add_argument(
         "--max-tokens", type=int, default=2048,
@@ -222,7 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--structured-output-mode",
         choices=("auto", "output_config", "output_format", "tool", "prompt"),
         default="auto",
-        help="Claude structured-output mode (default: auto)",
+        help="Claude-only structured-output mode (ignored by Gemini)",
     )
     investigate.add_argument(
         "--source-file", action="append", default=[],
@@ -402,17 +409,22 @@ def _command_investigate(args: argparse.Namespace, out) -> int:
     workspace = load_workspace(args.review_dir, args.dataset_label)
     workspace_path = workspace_path_for(args.review_dir, args.dataset_label)
 
-    record, written = run_claude_investigation(
-        workspace,
-        args.exception_id,
-        review_dir=args.review_dir,
-        workspace_path=workspace_path,
-        occurred_at=args.occurred_at,
-        source_files=args.source_file,
-        model=args.model,
-        max_tokens=args.max_tokens,
-        structured_output_mode=args.structured_output_mode,
-    )
+    runner = run_gemini_investigation if args.provider == "gemini" else run_claude_investigation
+
+    kwargs = {
+        "workspace": workspace,
+        "exception_id": args.exception_id,
+        "review_dir": args.review_dir,
+        "workspace_path": workspace_path,
+        "occurred_at": args.occurred_at,
+        "source_files": args.source_file,
+        "model": args.model,
+        "max_tokens": args.max_tokens,
+    }
+    if args.provider == "claude":
+        kwargs["structured_output_mode"] = args.structured_output_mode
+
+    record, written = runner(**kwargs)
 
     print(json.dumps(record, indent=2, sort_keys=True), file=out)
     print(f"Stored {written}", file=out)

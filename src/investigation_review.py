@@ -55,6 +55,7 @@ __all__ = [
     "store_investigation",
     "run_investigation",
     "run_claude_investigation",
+    "run_gemini_investigation",
     "get_investigation",
 ]
 
@@ -418,6 +419,46 @@ def run_claude_investigation(
     if advisory.get("provider") != "anthropic" or advisory.get("machine_generated") is not True:
         raise InvestigationStoreError(
             "Claude investigation did not return trusted Anthropic machine-generated provenance."
+        )
+
+    return store_investigation(
+        workspace,
+        exception_id,
+        advisory,
+        occurred_at=occurred_at,
+        review_dir=review_dir,
+        workspace_path=workspace_path,
+    )
+
+
+def run_gemini_investigation(
+    workspace: Mapping[str, Any],
+    exception_id: str,
+    *,
+    review_dir: str | Path,
+    workspace_path: str | Path,
+    occurred_at: str,
+    source_files: Iterable[Any] | None = None,
+    model: str | None = None,
+    max_tokens: int = 2048,
+) -> tuple[dict[str, Any], Path]:
+    """Construct the Gemini provider lazily, then run/store one advisory."""
+    from gemini_provider import GeminiInvestigationProvider
+
+    provider = GeminiInvestigationProvider(
+        model=model,
+        max_tokens=max_tokens,
+    )
+    advisory = _run_provider(
+        workspace,
+        exception_id,
+        provider,
+        source_files=source_files,
+    )
+
+    if advisory.get("provider") != "google-gemini" or advisory.get("machine_generated") is not True:
+        raise InvestigationStoreError(
+            "Gemini investigation did not return trusted Google Gemini machine-generated provenance."
         )
 
     return store_investigation(

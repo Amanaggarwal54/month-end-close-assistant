@@ -37,7 +37,48 @@ def test_parser_exposes_investigate():
     assert "investigate" in action.choices
 
 
-def test_investigate_command_calls_review_side_wiring(monkeypatch, tmp_path):
+def test_investigate_defaults_to_gemini(monkeypatch, tmp_path):
+    review = minimal_workspace(tmp_path)
+    observed = {}
+
+    def fake_run(workspace, exception_id, **kwargs):
+        observed["exception_id"] = exception_id
+        observed["kwargs"] = kwargs
+        record = {
+            "investigation_id": "INV-GEMINI-TEST",
+            "exception_id": exception_id,
+            "occurred_at": kwargs["occurred_at"],
+            "advisory": {
+                "provider": "google-gemini",
+                "model": "gemini-3.6-flash",
+                "machine_generated": True,
+            },
+        }
+        return record, review / "E4" / "investigation_advice.json"
+
+    monkeypatch.setattr(review_cli, "run_gemini_investigation", fake_run)
+
+    stream = io.StringIO()
+    code = review_cli.main([
+        "investigate",
+        "--dataset-label", "E4",
+        "--review-dir", str(review),
+        "--exception-id", "EXC-FXC-03-E4",
+        "--occurred-at", "2026-04-03T10:00:00Z",
+        "--model", "gemini-3.6-flash",
+        "--max-tokens", "512",
+        "--source-file", "data/raw/fx_rates_expected.csv",
+    ], out=stream)
+
+    assert code == review_cli.EXIT_OK
+    assert observed["exception_id"] == "EXC-FXC-03-E4"
+    assert observed["kwargs"]["model"] == "gemini-3.6-flash"
+    assert observed["kwargs"]["max_tokens"] == 512
+    assert observed["kwargs"]["source_files"] == ["data/raw/fx_rates_expected.csv"]
+    assert "INV-GEMINI-TEST" in stream.getvalue()
+
+
+def test_investigate_command_can_select_claude(monkeypatch, tmp_path):
     review = minimal_workspace(tmp_path)
     observed = {}
 
@@ -65,6 +106,7 @@ def test_investigate_command_calls_review_side_wiring(monkeypatch, tmp_path):
         "--review-dir", str(review),
         "--exception-id", "EXC-FXC-03-E4",
         "--occurred-at", "2026-04-03T10:00:00Z",
+        "--provider", "claude",
         "--model", "claude-sonnet-5",
         "--max-tokens", "512",
         "--structured-output-mode", "output_config",
