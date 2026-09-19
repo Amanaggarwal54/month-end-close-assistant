@@ -22,7 +22,6 @@ Layers
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -55,6 +54,7 @@ from reportlab.platypus import (  # noqa: E402
     TableStyle,
 )
 
+from paths import display_path, sha256_of, slugify  # noqa: E402,F401
 from plant_downstream_errors import ProtectedPathError, assert_writable  # noqa: E402,F401
 
 REPORT_VERSION = "1.0.0"
@@ -130,12 +130,6 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def slugify(label: str) -> str:
-    """Lowercase, non-alphanumerics to '-', so a label can never escape its directory."""
-    slug = re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")
-    return slug or "unlabelled"
-
-
 def _month_key(value: Any) -> str | None:
     text = _text(value).strip()
     if not text:
@@ -144,14 +138,6 @@ def _month_key(value: Any) -> str | None:
         return pd.Period(pd.to_datetime(text), freq="M").strftime("%Y-%m")
     except Exception:  # noqa: BLE001
         return None
-
-
-def sha256_of(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +198,10 @@ class ReportModel:
     # constructs, filters or re-orders them: it only serialises what it is given.
     audit_trail: dict = field(default_factory=dict)
     exception_records: list[dict] = field(default_factory=list)
+    # Built upstream by exception_workflow.py. Carried here to be serialised and
+    # nothing else: the register records investigation state, and this module
+    # neither constructs it nor lets it reach the close decision it presents.
+    exception_register: dict = field(default_factory=dict)
 
     @property
     def report_allowed(self) -> bool:
@@ -291,6 +281,7 @@ def build_report_model(
     period: str = "January - March 2026",
     audit_trail: dict | None = None,
     exception_records: list[dict] | None = None,
+    exception_register: dict | None = None,
 ) -> ReportModel:
     """Assemble everything the report shows. Pure: no file I/O, no mutation.
 
@@ -509,6 +500,7 @@ def build_report_model(
         inputs=list(inputs or []),
         audit_trail=dict(audit_trail or {}),
         exception_records=list(exception_records or []),
+        exception_register=dict(exception_register or {}),
     )
 
 
@@ -851,7 +843,8 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     """Write the PDF, control results, decision, audit files and manifest.
 
     The audit trail and the exception list are written exactly as ``audit.py``
-    built them; nothing here inspects or reshapes their contents.
+    built them, and the exception register exactly as ``exception_workflow.py``
+    built it; nothing here inspects or reshapes their contents.
     """
     root = assert_writable(Path(out_dir) / slugify(model.dataset_label))
     root.mkdir(parents=True, exist_ok=True)
@@ -862,6 +855,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     json_path = root / "close_decision.json"
     audit_path = root / "audit_trail.json"
     exceptions_path = root / "exceptions.json"
+    register_path = root / "exception_register.json"
     manifest_path = root / "package_manifest.json"
 
     render_pdf(model, pdf_path)
@@ -871,6 +865,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     _write_json(json_path, model.decision, default=str)
     _write_json(audit_path, model.audit_trail)
     _write_json(exceptions_path, model.exception_records)
+    _write_json(register_path, model.exception_register)
 
     outputs = {
         "report_pdf": pdf_path,
@@ -878,6 +873,7 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
         "close_decision": json_path,
         "audit_trail": audit_path,
         "exceptions": exceptions_path,
+        "exception_register": register_path,
     }
     manifest = {
         "dataset_label": model.dataset_label,
@@ -899,21 +895,6 @@ def write_decision_package(model: ReportModel, out_dir: str | Path = "out") -> d
     _write_json(manifest_path, manifest)
     outputs["package_manifest"] = manifest_path
     return outputs
-
-
-def display_path(path: str | Path) -> str:
-    """Path as shown in the provenance appendix.
-
-    Rendered relative to the working directory when the file sits under it, so
-    two callers that name the same file differently (one absolute, one relative)
-    produce identical documents - and so a committed example report does not
-    carry the author's home directory.
-    """
-    candidate = Path(path)
-    try:
-        return Path(candidate).resolve().relative_to(Path.cwd().resolve()).as_posix()
-    except ValueError:
-        return candidate.resolve().as_posix()
 
 
 def describe_inputs(paths: dict[str, str | Path]) -> list[dict]:

@@ -328,7 +328,8 @@ def test_decision_package_contains_every_artefact_with_matching_hashes(tmp_path:
     written = write_decision_package(model, tmp_path)
 
     assert set(written) == {"report_pdf", "control_results", "close_decision",
-                            "audit_trail", "exceptions", "package_manifest"}
+                            "audit_trail", "exceptions", "exception_register",
+                            "package_manifest"}
     for path in written.values():
         assert path.exists()
 

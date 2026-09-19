@@ -51,6 +51,7 @@ data/error_data ───────►│  load_artefacts()   I/O: read the CS
                         │        │  controls.decide_close                 │
                         │        │  audit.build_exception_records         │
                         │        │  audit.build_audit_trail               │
+                        │        │  exception_workflow.build_register      │
                         │        │  report.build_report_model             │
                         │        ▼                                        │
                         │  write_outputs()    I/O: report.write_package   │
@@ -94,6 +95,7 @@ class CloseRunResult:
     decision: dict
     exception_records: list[dict]  # built by audit.py, carried to the package
     audit_trail: dict              # built by audit.py, carried to the package
+    exception_register: dict       # built by exception_workflow.py, carried to the package
     model: ReportModel
     written: dict[str, Path]       # empty when write_package is False
     exit_code: int                 # 0 allowed, 2 blocked
@@ -210,7 +212,7 @@ explanation, so the terminal tells you what broke without opening the PDF. On a
 | 3 | E5 blocked | `exit_code 2`, `ICO-01` among blocking controls |
 | 4 | E6 blocked | `exit_code 2`, `ICO-03` among blocking controls |
 | 5 | E1/E2/E3 blocked | `exit_code 2`, blocking set is `{MAT-03, MAT-04, MAT-06}` |
-| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `audit_trail.json`, `exceptions.json`, `package_manifest.json` all present under `out/<label>/` |
+| 6 | Package existence | PDF, `control_results.csv`, `close_decision.json`, `audit_trail.json`, `exceptions.json`, `exception_register.json`, `package_manifest.json` all present under `out/<label>/` |
 | 7 | **Parity with direct module use** | run the modules by hand with the same fixed timestamp, then run the pipeline; assert the SHA-256 of the PDF, CSV and JSON match. This is requirement 10, tested rather than asserted in prose |
 | 8 | Source protection | `out_dir=data/raw` raises `ProtectedPathError` and the CLI returns 1 |
 | 9 | No mutation | SHA-256 of every file under `data/raw` unchanged after a full run; input DataFrames unchanged |
@@ -317,3 +319,186 @@ Serialisation is `indent=2`, `sort_keys=True`, UTF-8. Sorting fixes the key
 order; list order is left alone, so the exception ordering `audit.py` already
 determined is what reaches disk. `package_manifest.json` hashes both new files
 and still excludes itself.
+
+---
+
+## 13. Amendment (Step 12B): the exception register in the package
+
+After building the audit trail, the pipeline calls
+`exception_workflow.build_exception_register(exception_records, dataset_label)`
+and carries the result into the report model. The package therefore contains
+seven artefacts:
+
+```
+out/<dataset_label>/
+├── close_report_<label>_<stamp>.pdf   (or close_exception_report_… when blocked)
+├── control_results.csv
+├── close_decision.json
+├── audit_trail.json
+├── exceptions.json
+├── exception_register.json   one OPEN investigation record per audit exception
+└── package_manifest.json
+```
+
+**The register is downstream of the decision and never flows back into it.** The
+order in `execute_close` is deliberate: `run_controls` → `decide_close` →
+`build_exception_records` → `build_audit_trail` → `build_exception_register`.
+Nothing after `decide_close` is read by it, so a resolution status cannot turn a
+FAIL into a PASS, cannot alter `control_results.csv`, `audit_trail.json` or
+`close_decision.json`, and cannot change `report_allowed`. Two tests hold that
+line: one resolves every E4 exception in memory and asserts the decision, the
+control results and the audit trail are all unchanged; one writes a package from
+a fully resolved register and asserts the decision file still says FAIL and the
+document is still the exception report.
+
+The source of truth for control failures remains
+`control_results → decide_close → audit_trail/exceptions`. The register opens a
+record per audit exception and preserves each one under `source_exception`; it
+does not discover failures of its own.
+
+`exception_workflow.py` stays pure: standard library only, no file I/O, no
+imports of `audit`, `controls`, `match`, `intercompany`, `report` or `pipeline`,
+and no generated timestamps. The pipeline calls it; `report.py` only serialises
+what it is handed, and a test asserts `report.py` neither imports the module nor
+calls the builder.
+
+---
+
+## 14. Amendment (Step 12D): the review workspace lives outside the package
+
+The close package is evidence of the close at the moment it was run, and it is
+finished the moment it is written. Investigation happens in a separate tree:
+
+```
+out/<dataset_label>/                          immutable close package (7 files)
+└── exception_register.json                   close-time snapshot, always OPEN
+
+review/<dataset_label>/
+└── exception_resolution.json                 mutable investigation record
+```
+
+`src/review_workspace.py` owns the file I/O that `exception_workflow.py` must
+never acquire: package provenance, integrity verification, workspace creation
+and persistence. It owns no lifecycle rules - statuses, transitions, resolution
+requirements and history stay in `exception_workflow.py`, which it calls. A test
+parses the module and asserts it neither redefines a status constant nor a
+transition table.
+
+`create_resolution_workspace(package_dir, review_dir)` re-hashes **every**
+artefact the manifest records, not only the register, and refuses a package that
+disagrees with its own manifest. The workspace then records
+`exception_register_sha256` and `package_manifest_sha256`, so it can always be
+traced to the package it came from.
+
+**The one thing integrity cannot cover:** a manifest cannot contain a stable
+hash of itself, so metadata edited inside the manifest - a `close_status`, say -
+is undetectable from within the package. Any recorded hash that is altered is
+caught, because it stops matching its file. Closing the remaining gap needs a
+signature or a record held outside the package.
+
+Writing refuses any path inside the close package, the same way the error
+injector refuses `data/raw`. Truth still runs one way only: `pipeline.py` and
+`report.py` contain no reference to the review workspace, and a test asserts it.
+A RESOLVED exception in a workspace records that somebody investigated a
+failure; the package still says FAIL, and its register still says OPEN.
+
+---
+
+## 15. Amendment (Step 12E): the reviewer command line
+
+`src/review_cli.py` is the front end a reviewer actually uses. It parses
+arguments, loads a workspace, applies exactly one operation, writes it back and
+prints something readable. It decides nothing.
+
+```
+review_cli.py        argument parsing, output, exit codes
+      |
+review_workspace.py  provenance, integrity, workspace persistence
+      |
+exception_workflow.py  ids, owners, statuses, transitions, history, validation
+```
+
+| Command | Responsibility |
+|---|---|
+| `create` | verify the close package through `create_resolution_workspace()`, then write the workspace |
+| `list` | one deterministic line per exception: id, status, owner, severity, control |
+| `show` | the complete record for one exception, as sorted-key JSON |
+| `assign` | set or clear the owner (`--owner` / `--clear-owner`) |
+| `transition` | move to a status, passing comment and evidence through unchanged |
+| `resolve` | transition to RESOLVED, requiring `--comment` and at least one `--evidence` |
+
+Evidence is given as `--evidence TYPE:REFERENCE` and is repeatable. Only the
+first colon separates the two fields, so a reference may itself contain colons -
+a path or a timestamp usually does.
+
+**Exit codes**
+
+| Code | Meaning |
+|---|---|
+| 0 | the command succeeded |
+| 1 | the input could not be used: missing workspace, unknown exception, bad argument |
+| 2 | the workflow refused the operation: invalid transition, missing comment or evidence |
+| 3 | the close package does not match its own manifest |
+| 4 | the command would have written inside the immutable close package |
+
+1 and 2 are deliberately different: 2 means the lifecycle rules did their job,
+1 means the command never got far enough to be judged.
+
+**No rules live here.** Statuses, allowed transitions, the terminal RESOLVED
+state and the comment-and-evidence a resolution requires are all enforced in
+`exception_workflow.py` and reach the CLI only through `review_workspace.py`. A
+test parses `review_cli.py` and asserts it redefines no status constant and no
+transition table, and that it imports neither pandas nor numpy.
+
+**No clock.** Every mutating command requires `--occurred-at` and stores it
+verbatim; a test passes a deliberately non-ISO string and asserts it survives
+character-for-character.
+
+**`create` refuses to overwrite an existing workspace** unless `--force` is
+given. Re-creating rebuilds every entry from the close package, so a second run
+would silently discard an investigation already recorded in the workspace.
+
+**Dependency note.** The three generic helpers `sha256_of`, `slugify` and
+`display_path` live in `src/paths.py` (see §16), so the reviewer tool shares one
+hashing convention with the close package without inheriting the reporting
+stack.
+
+---
+
+## 16. Amendment (Step 12F): generic helpers moved out of report.py
+
+`sha256_of`, `slugify` and `display_path` are needed by the close package and by
+the reviewer tool, and belong to neither. They were defined in `report.py`, so
+`review_workspace.py` imported the reporting module to reach them and a reviewer
+running `review_cli list` loaded pandas, numpy, reportlab and PIL to print five
+lines of text.
+
+They now live in `src/paths.py`: standard library only, no project imports.
+
+```
+paths.py              hashlib, re, pathlib - nothing else
+   |         \
+report.py     review_workspace.py -> review_cli.py
+   |
+pandas, numpy, reportlab   (only where they are genuinely needed)
+```
+
+There is exactly one implementation of each helper. `report.py` re-exports all
+three, so `from report import sha256_of` keeps working for every existing
+caller, and a test asserts `report.sha256_of is paths.sha256_of` - the same
+object, so the two sides cannot drift.
+
+Measured in fresh interpreters:
+
+| import | modules loaded | pandas / numpy / reportlab |
+|---|---|---|
+| `paths` | 57 | none |
+| `review_workspace` | 67 | none |
+| `review_cli` | 70 | none |
+| `report` | 176 | all, as it should |
+
+The dependency tests run in a subprocess rather than checking this process's
+`sys.modules`, because the test session has already imported pandas for its own
+reasons and an in-process check would pass regardless of what the production
+imports do. A positive control asserts `report` still loads the stack, so the
+negative tests cannot pass by measuring nothing.

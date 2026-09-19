@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from audit import build_audit_trail, build_exception_records  # noqa: E402
 from controls import ControlConfig, decide_close, run_controls  # noqa: E402
+from exception_workflow import build_exception_register  # noqa: E402
 from intercompany import check_elimination, generate_intercompany_entries  # noqa: E402
 from match import three_way_match  # noqa: E402
 from plant_downstream_errors import ProtectedPathError  # noqa: E402
@@ -124,6 +125,7 @@ class CloseRunResult:
     run_timestamp: str
     exception_records: list[dict] = field(default_factory=list)
     audit_trail: dict = field(default_factory=dict)
+    exception_register: dict = field(default_factory=dict)
     written: dict[str, Path] = field(default_factory=dict)
 
     @property
@@ -220,6 +222,17 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
     audit_trail = build_audit_trail(
         control_results, decision, exception_records=exception_records
     )
+    # The register opens an investigation record per audit exception. It is built
+    # after the decision and is never read back into it: resolution state tracks
+    # what a person did about a failure, it does not change whether the control
+    # failed or whether the close may be reported.
+    # The run timestamp is this close's creation time and already stamps every
+    # other artefact, so it is passed explicitly as the CREATED time rather than
+    # left None: without it the register could not answer when an exception was
+    # raised. The workflow still generates nothing of its own.
+    exception_register = build_exception_register(
+        exception_records, config.dataset_label, occurred_at=timestamp
+    )
 
     model = build_report_model(
         match_results=match_results,
@@ -236,6 +249,7 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
         max_exception_rows=config.max_exception_rows,
         audit_trail=audit_trail,
         exception_records=exception_records,
+        exception_register=exception_register,
     )
     return CloseRunResult(
         config=config,
@@ -246,6 +260,7 @@ def execute_close(sources: SourceFrames, config: CloseRunConfig) -> CloseRunResu
         run_timestamp=timestamp,
         exception_records=exception_records,
         audit_trail=audit_trail,
+        exception_register=exception_register,
     )
 
 
