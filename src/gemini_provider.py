@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 PROVIDER_NAME = "google-gemini"
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 API_KEY_ENV = "GEMINI_API_KEY"
 MODEL_ENV = "GEMINI_MODEL"
 METADATA_FIELDS = ("provider", "model", "machine_generated")
