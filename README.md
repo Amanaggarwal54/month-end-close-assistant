@@ -152,7 +152,7 @@ Gemini is the default live provider:
 
 ```text
 GEMINI_API_KEY
-GEMINI_MODEL=gemini-3.6-flash
+GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
 Claude remains available as an optional provider:
