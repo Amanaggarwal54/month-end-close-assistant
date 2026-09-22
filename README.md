@@ -386,7 +386,6 @@ month-end-close-assistant/
 |   +-- paths.py
 |
 +-- tests/                   unit and integration tests
-+-- soda/                    data-quality configuration
 +-- .github/workflows/       CI configuration
 +-- out/                     generated close packages (ignored by Git)
 +-- review/                  generated review workspaces (ignored by Git)
